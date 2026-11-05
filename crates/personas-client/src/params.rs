@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use ark_serialize::{CanonicalDeserialize, Compress, Validate};
 use personas_core::{PK, circuits::NP};
@@ -17,6 +18,21 @@ use crate::PersonaClient;
 /// lifetime and a key is megabytes: fetching one for every proof goes unnoticed on
 /// loopback but dominates over a real network.
 static FETCHED: LazyLock<Mutex<HashMap<String, Arc<Vec<u8>>>>> = LazyLock::new(Default::default);
+
+/// How long one parameter may take to download. A client's default 30 s covers the whole
+/// request, body included, which the larger keys exceed on an ordinary connection.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(600);
+const FETCH_ATTEMPTS: u32 = 5;
+
+fn cause_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text = format!("{text}: {cause}");
+        source = cause.source();
+    }
+    text
+}
 
 impl PersonaClient {
     /// GET `route` (once per process) and canonical-deserialize a parameter.
@@ -32,21 +48,7 @@ impl PersonaClient {
 
         let cached = FETCHED.lock().unwrap().get(url.as_str()).cloned();
         let bytes = cached.unwrap_or_else(|| {
-            let response = self
-                .bul
-                .client
-                .get(url.clone())
-                .send()
-                .unwrap_or_else(|e| panic!("failed to fetch {route} from the server: {e}"));
-            assert!(
-                response.status().is_success(),
-                "server answered {} for {route}",
-                response.status()
-            );
-            let bytes = response
-                .bytes()
-                .unwrap_or_else(|e| panic!("server returned no body for {route}: {e}"));
-            let bytes = Arc::new(bytes.to_vec());
+            let bytes = Arc::new(self.download(&url, route));
             FETCHED
                 .lock()
                 .unwrap()
@@ -56,6 +58,35 @@ impl PersonaClient {
 
         T::deserialize_with_mode(bytes.as_slice(), Compress::No, Validate::No)
             .unwrap_or_else(|e| panic!("server returned an undecodable parameter for {route}: {e}"))
+    }
+
+    /// Download a parameter, retrying: a transfer of tens of MB through a load balancer can
+    /// be cut off partway. Says why each attempt failed (reqwest's own message for a failed
+    /// body is only "error decoding response body").
+    fn download(&self, url: &url::Url, route: &str) -> Vec<u8> {
+        let mut last = String::new();
+        for attempt in 1..=FETCH_ATTEMPTS {
+            let started = Instant::now();
+            let result = self
+                .bul
+                .client
+                .get(url.clone())
+                .timeout(FETCH_TIMEOUT)
+                .send()
+                .and_then(reqwest::blocking::Response::error_for_status)
+                .and_then(reqwest::blocking::Response::bytes);
+            match result {
+                Ok(bytes) => return bytes.to_vec(),
+                Err(e) => {
+                    last = cause_chain(&e.without_url());
+                    eprintln!(
+                        "fetching {route}: attempt {attempt} failed after {:.1}s: {last}",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+            }
+        }
+        panic!("could not fetch {route} from the server: {last}");
     }
 
     fn fetch_pk(&self, route: &str) -> PK {

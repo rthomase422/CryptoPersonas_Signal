@@ -380,7 +380,11 @@ pub fn run(args: &Args, work: &Path, callbacks: usize) {
         pc.join().expect("join failed");
         pc
     };
-    let http = reqwest::blocking::Client::new();
+    // Longer than the default 30 s: a folded scan is megabytes to upload.
+    let http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+        .expect("cannot build the HTTP client");
     let jsonrpc = api.join("api/jsonrpc").unwrap();
 
     // --- history: other members' proved posts --------------------------------------------
