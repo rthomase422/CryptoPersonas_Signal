@@ -803,9 +803,9 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
     // A scan pins the replica's CURRENT callback roots, and every replica rejects it if
     // a settlement re-pinned them before the scan's barrier ("scan names a superseded
     // barrier"). Proving takes seconds, so a scan can go stale while it is being made.
-    // A stale scan that is SENT is the dangerous case: it reveals the member's nullifier
-    // (under the member's real name — scans are attributable), every replica rejects it,
-    // and the member's local object has nevertheless advanced past it.
+    // A stale scan that is SENT is the dangerous case: it reveals the member's nullifier,
+    // every replica rejects it, and the member's local object has nevertheless advanced
+    // past it.
     //
     // So a scan is produced in two steps. `prepare_scan` proves it and advances the
     // object but releases nothing; the caller checks `scan_still_valid` (after waiting

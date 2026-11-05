@@ -185,6 +185,15 @@ pub struct JsJoinCounts {
 }
 
 /// The account a join or re-join approval names, and which kind it is.
+/// A poll's text and kind, read from its record.
+#[napi(object)]
+pub struct JsPollText {
+    pub question: String,
+    pub options: Vec<String>,
+    /// `"ban"` or `"standard"`.
+    pub kind: String,
+}
+
 #[napi(object)]
 pub struct JsAccountClaim {
     /// `"join"`, `"rejoin-approve"` or `"ban"`.
@@ -937,6 +946,33 @@ impl Engine {
         Some(JsAccountClaim {
             kind: kind.to_string(),
             account: hex::encode(personas_core::account_bytes(&account)),
+        })
+    }
+
+    /// The text and kind of a `PollOpen` record, read from its bytes; `None` for any other
+    /// record. What a poll bubble is drawn from, so a poll cannot display one thing and
+    /// mean another.
+    #[napi]
+    pub fn record_poll(&self, record: Buffer) -> Option<JsPollText> {
+        use personas_bulletin::replica::record::Record;
+        let (rec, _) = personas_bulletin::replica::record::decode(record.as_ref()).ok()?;
+        let Record::PollOpen {
+            question,
+            options,
+            kind,
+            ..
+        } = rec
+        else {
+            return None;
+        };
+        Some(JsPollText {
+            question,
+            options,
+            kind: match kind {
+                PollKind::Ban => "ban",
+                PollKind::Standard => "standard",
+            }
+            .to_string(),
         })
     }
 

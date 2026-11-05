@@ -337,6 +337,14 @@ export async function handleDataMessage(
         return;
       }
     }
+    // For checking that every member sees the same service timestamp on a record.
+    const incomingRecord = decodeRecordBody(initialMessage.body);
+    if (incomingRecord) {
+      log.info(
+        `personas stamp: record …${incomingRecord.toString('base64').slice(-16)} ` +
+          `sent_at=${message.get('sent_at')} server=${message.get('serverTimestamp')}`
+      );
+    }
     const personasRecord = ingestRecordForTimeline(
       personasGroupId,
       initialMessage.body,
@@ -344,25 +352,6 @@ export async function handleDataMessage(
     );
     if (personasRecord.kind === 'ingested') {
       log.info(`${idLog}: personas protocol record ingested (no timeline entry)`);
-      confirm();
-      return;
-    }
-
-    // A SILENT poll: ingested and settled like any other, but never rendered.
-    //
-    // This is how an admin's permanent ban stays invisible. The record has already
-    // been ingested by `ingestRecordForTimeline` above — the replica will tally and
-    // settle it, invoke BAN_FLAG at the close barrier, and the target's scan will
-    // absorb it — so returning here costs nothing protocol-side.
-    //
-    // Suppressing it on the sender with `hideFromTimeline` was not enough, and that
-    // was the bug: every RECIPIENT decodes the same record and builds its own poll
-    // bubble, so the poll remained visible to everyone except the admin who cast it.
-    // Rendering has to be declined where the message is built, on each client.
-    if (personasRecord.kind === 'poll' && personasRecord.descriptor.silent) {
-      log.info(
-        `${idLog}: silent ${personasRecord.descriptor.kind} poll ingested (deliberately not rendered)`
-      );
       confirm();
       return;
     }

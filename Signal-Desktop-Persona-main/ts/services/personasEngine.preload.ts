@@ -33,8 +33,9 @@ import {
   encodePollBody,
   encodeVoteBody,
   encodeRateBody,
+  encodeScanBody,
   decodeRecordBody,
-  decodePollDescriptor,
+  pollDescriptorFromRecord,
   decodeRelayBody,
   encodeRelayBody,
   type PersonaChoice,
@@ -516,12 +517,15 @@ export function ingestRecordForTimeline(
       `ingested record: ${status.status}${status.reason ? ` (${status.reason})` : ''}`
     );
 
-    // A poll carries its display descriptor in the carriage (the engine hands back
-    // no option labels), so render it from there — keyed by the eh the engine just
-    // gave us, which is the handle a ballot must reference.
-    const descriptor = decodePollDescriptor(body);
-    if (descriptor) {
-      return { kind: 'poll', eh: status.eh, descriptor };
+    // A poll is drawn from its own record, keyed by the eh the engine just gave us,
+    // which is the handle a ballot must reference.
+    const poll = currentEngine.recordPoll(record);
+    if (poll) {
+      return {
+        kind: 'poll',
+        eh: status.eh,
+        descriptor: pollDescriptorFromRecord(poll),
+      };
     }
 
     // A post the replica is holding (it names group state we do not have yet, such as
@@ -740,9 +744,7 @@ export function composePersonaRate(
 }
 
 // Open a poll. A `ban` poll must name the post under review via `targetEh`; option 0
-// is the ban option by convention (matching the engine's own e2e test). The returned
-// body carries the display descriptor alongside the record so recipients can label
-// the options — see `encodePollBody`.
+// is the ban option by convention (matching the engine's own e2e test).
 export function composePersonaPoll(
   groupId: string | undefined,
   descriptor: PersonaPollDescriptor,
@@ -770,7 +772,7 @@ export function composePersonaPoll(
   benchEmitted(groupId, currentEngine, 'poll', startMs, emitted.eh);
   return {
     eh: emitted.eh,
-    body: encodePollBody(emitted.bytes, descriptor),
+    body: encodePollBody(emitted.bytes),
     descriptor,
   };
 }
@@ -858,7 +860,7 @@ export function commitPersonaScan(
     scanStartedMs.get(groupId) ?? benchNowMs(),
     emitted.eh
   );
-  return { eh: emitted.eh, body: encodeRecordBody(emitted.bytes) };
+  return { eh: emitted.eh, body: encodeScanBody(emitted.bytes) };
 }
 
 export const BADGE_SLOTS: ReadonlyArray<{ slot: number; name: string }> = [

@@ -44,7 +44,9 @@ export function getBarrierSchedule(groupId: string | undefined): BarrierSchedule
 // timestamp, which the sender also placed its copy by — personasRegistry), unless it is
 // implausibly far from the server's receive time, in which case the server's. Every
 // recipient sees the same two values, so they all agree either way.
-const MAX_SENT_AT_SKEW_MS = 60_000;
+// A sender picks its own `sent_at`, so this skew bounds how many barriers it can choose
+// between: at one barrier period, about three.
+const MAX_SENT_AT_SKEW_MS = 10_000;
 export function recordTimestamp(
   sentAtMs: number | null | undefined,
   serverTimestampMs: number | null | undefined

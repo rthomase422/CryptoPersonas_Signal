@@ -76,6 +76,7 @@ import {
   maybeSendPersonaRateForReaction,
   sendPersonaPoll,
   drainPersonaScans,
+  ensureReadyForPersonaAction,
   runFullPersonaSweep,
   isPersonaBanned,
 } from '../../services/personasActions.preload.ts';
@@ -1259,25 +1260,11 @@ function sendMultiMediaMessage(
           });
           return;
         }
-        // Absorb anything outstanding BEFORE posting. The protocol wants this: the post
-        // predicate constrains `num_interactions_since_last_scan != NUM_INTS_BEFORE_SCAN`
-        // (200), so a member who never scans eventually cannot post at all — their proof
-        // becomes unsatisfiable. Scanning on send keeps that counter from ever reaching
-        // the wall, and absorbs a revocation promptly instead of on a timer.
-        //
-        // `drainPersonaScans`, not a single `sendPersonaScan`. One scan starts a sweep;
-        // it does not necessarily finish one, and while a sweep is unfinished the engine
-        // refuses every other emit — so a single scan here could leave the very next
-        // line refused. That was the "cannot send after my badge was approved" failure:
-        // an approval files a callback, the one-shot scan started the sweep, and the
-        // post was then rejected by `guard_not_scanning`.
-        //
-        // Quiet inside: the engine refuses a scan with no outstanding callbacks
-        // (NothingToScan), which is the normal case for most messages and not a failure.
-        // When there IS something to absorb this costs a Groth16 proof per round before
-        // the message goes out — the price of doing it here rather than in the
-        // background.
-        if (!(await drainPersonaScans(conversation))) {
+        // NEVER SCAN BECAUSE A POST IS ABOUT TO GO OUT: a scan right before a post links
+        // the two. Scans run on the public schedule (personasScanSchedule). The one wait
+        // here is for a sweep already under way, because the engine refuses a post until
+        // it ends.
+        if (!(await ensureReadyForPersonaAction(conversation))) {
           log.error(
             'sendMultiMediaMessage: callback sweep would not finish; refusing to send ' +
             'rather than letting the post be rejected mid-flight'

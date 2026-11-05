@@ -458,3 +458,31 @@ fn claims_too_recent_to_check_are_pending() {
     let report = r.view_report();
     assert_eq!((report.pending, report.diverged()), (1, false));
 }
+
+/// Audit H1/H2: a record backdated into an earlier barrier replays that barrier, and a
+/// root other records already named must not stop being produced when it does.
+#[test]
+#[ignore = "audit H1/H2: open until proofs name settled roots"]
+fn a_backdated_record_does_not_unproduce_a_root() {
+    let mut r = replica();
+    let a = join(1);
+    r.ingest_at(a.0.clone(), 0).unwrap();
+    r.advance_to(1);
+    let y = join(2);
+    let mut candidate = 3;
+    let x = loop {
+        let c = join(candidate);
+        if c.1 < y.1 {
+            break c;
+        }
+        candidate += 1;
+    };
+    r.ingest_at(y.0.clone(), 1).unwrap();
+    let root_after_y = r.obj_root();
+    assert!(r.has_produced_root(root_after_y));
+    r.advance_to(2);
+    assert!(r.has_produced_root(root_after_y));
+    // X arrives late, stamped into barrier 1.
+    r.ingest_at(x.0.clone(), 1).unwrap();
+    assert!(r.has_produced_root(root_after_y));
+}

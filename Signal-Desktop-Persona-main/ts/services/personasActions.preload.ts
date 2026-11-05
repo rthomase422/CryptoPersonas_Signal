@@ -18,9 +18,10 @@
 //   3. route correctly, following what the CIRCUIT already does. POSTS, POLLS,
 //      BALLOTS and RATINGS all identify their author by a pseudonym in-circuit, so all
 //      four ride the shared phantom — an attributable envelope would re-identify what
-//      the proof anonymised. JOINS and SCANS stay attributable: the anti-Sybil
-//      accounting rests on one membership per real account, which an anonymous join
-//      would defeat. See personasCarriage for the marker split.
+//      the proof anonymised. So do SCANS, whose timing follows a member's private
+//      tickets. JOINS stay attributable: the anti-Sybil accounting rests on one
+//      membership per real account, which an anonymous join would defeat. See
+//      personasCarriage for the marker split.
 //
 // Everything here is best-effort and logged: a failed action must never take down the
 // message pipeline, and must never fall back to a weaker path.
@@ -44,6 +45,10 @@ import {
   emitAndSelfIngest,
   type PersonaPollDescriptor,
 } from './personasEngine.preload.ts';
+import {
+  BAN_POLL_OPTIONS,
+  pollDescriptorFromRecord,
+} from './personasCarriage.std.ts';
 import { ensurePersonaJoined } from './personasMembership.preload.ts';
 import { getBarrierSchedule } from './personasBarrier.preload.ts';
 import { sleep } from '../util/sleep.std.ts';
@@ -58,7 +63,6 @@ const log = createLogger('personasActions');
 // load-bearing: put "Keep" first and a majority to keep would revoke instead.
 const BAN_OPTION_INDEX = 0;
 
-const BAN_POLL_OPTIONS = ['Ban', 'Keep'] as const;
 
 strictAssert(
   BAN_POLL_OPTIONS[BAN_OPTION_INDEX] === 'Ban',
@@ -102,9 +106,9 @@ export async function sendPersonaRate(
 }
 
 // Open a poll. For a ban poll, `targetEh` names the post under review and option
-// BAN_OPTION_INDEX is the ban. The message we enqueue keeps the descriptor so our own
-// timeline draws the bubble immediately; the wire body (personaCarriageBody) carries
-// the record plus the same descriptor for recipients.
+// BAN_OPTION_INDEX is the ban. The message we enqueue keeps the poll's text so our own
+// timeline draws the bubble immediately, exactly as recipients draw it from the record
+// in the wire body (personaCarriageBody).
 export async function sendPersonaPoll(
   conversation: ConversationModel,
   descriptor: PersonaPollDescriptor,
@@ -140,9 +144,7 @@ export async function sendPersonaPoll(
       // matches what every recipient sees.
       personaAnonymous: true,
       personaPoll: {
-        question: descriptor.question,
-        options: [...descriptor.options],
-        kind: descriptor.kind,
+        ...pollDescriptorFromRecord(descriptor),
         target: descriptor.kind === 'ban' ? targetEh : undefined,
       },
       personaCarriageBody: poll.body,
@@ -459,8 +461,8 @@ export async function maybeSendPersonaRateForReaction({
 }
 
 // Emit a scan, absorbing the revocation callbacks fired since our last one. This is
-// what turns a settled ban into a flag on everyone's replica, so it runs on a timer
-// (see startPersonaScanLoop) rather than waiting for a human.
+// how a settled ban or a badge reaches the member's own object. It runs on the public
+// schedule (personasScanSchedule) and never because the member is about to act.
 // A scan is a SYNCHRONOUS Groth16 proof (`emitScan()` is a blocking napi call) executed
 // in the render process, where the preload context lives. It is the most expensive thing
 // this integration does: it holds the proving key set resident and blocks the main thread
@@ -661,7 +663,7 @@ export async function drainPersonaScans(
   const limit = maxRounds ?? Math.min(2 * engine.outstandingCallbacks() + 2, 40);
   for (let round = 0; round < limit; round += 1) {
     // Nothing invoked, no sweep under way, not near the interaction cap: a scan would
-    // prove that nothing happened. Skip it — this is the common case before a post.
+    // prove that nothing happened. Skip it.
     if (!engine.scanNeeded()) {
       if (round > 0) {
         log.info(`drainPersonaScans: absorbed everything in ${round} scan(s)`);
@@ -704,11 +706,9 @@ export async function sendPersonaScan(
     await scanFinished;
     return true;
   }
-  // `quiet` is for the SPECULATIVE scan attempted before each send. The engine refuses a
-  // scan with fewer than NUM_SCANS_PER_FOLD (=1) outstanding callbacks — `NothingToScan`
-  // — which for a send-time attempt is the overwhelmingly common case and is not an
-  // error in any sense. Logging it at error level on every message would bury real
-  // failures in noise.
+  // `quiet` is for a scan that may have nothing to do. The engine refuses a scan with
+  // fewer than NUM_SCANS_PER_FOLD (=1) outstanding callbacks — `NothingToScan` — which
+  // is not an error in any sense, and logging it as one would bury real failures.
   scanInFlight = true;
   let markFinished = (): void => undefined;
   scanFinished = new Promise<void>(resolve => {

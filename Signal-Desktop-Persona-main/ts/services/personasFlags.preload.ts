@@ -24,6 +24,8 @@
 // import the native ZK addon transitively.
 
 
+import { randomBytes } from 'node:crypto';
+
 import { createLogger } from '../logging/log.std.ts';
 import { toLogFormat } from '../types/errors.std.ts';
 import { drop } from '../util/drop.std.ts';
@@ -33,7 +35,13 @@ import {
   isPersonasEngineEnabled,
   isPostFlagged,
 } from './personasEngine.preload.ts';
-import { sendPersonaScan } from './personasActions.preload.ts';
+import { drainPersonaScans } from './personasActions.preload.ts';
+import { getBarrierSchedule } from './personasBarrier.preload.ts';
+import {
+  pickScanSlot,
+  scanEpochAt,
+  scanEpochMs,
+} from './personasScanSchedule.std.ts';
 import { maybeCompletePersonasReset } from './personasReset.preload.ts';
 import { maybeContinueCatchUp } from './personasCatchUp.preload.ts';
 import { hasJoinedPersonaGroup } from './personasMembership.preload.ts';
@@ -45,36 +53,13 @@ const log = createLogger('personasFlags');
 // it can be brisk enough that a ban visibly lands while you watch.
 const REFRESH_INTERVAL_MS = 2_000;
 
-// The IDLE CATCH-UP interval. Scanning now happens primarily on send (see the composer
-// duck), which covers any member who is actually talking. This timer exists only for a
-// client that sits open for days without sending anything: it should still absorb a
-// revocation aimed at it rather than carrying it indefinitely.
-//
-// 24 hours rather than 30 seconds because a scan is a synchronous Groth16 proof on the
-// render process's main thread. At 30s intervals that is a constant background cost and
-// a constant stream of records for no benefit; the send-time scan is what keeps a
-// talking member current.
-const SCAN_INTERVAL_MS = 24 * 60 * 60 * 1_000;
+// How often the loop checks whether a group's scan slot has come.
+const SCAN_TICK_MS = 15_000;
 
-// Automatic scanning is OFF by default.
-//
-// A scan is the most expensive thing this integration does: `emitScan` is a synchronous
-// Groth16 proof on the render process's main thread, and it puts a record on the wire.
-// Doing that every 30 seconds forever — whether or not anything is outstanding — is a
-// lot of background work and a lot of traffic for a demo, and it makes the timeline of
-// "what caused what" hard to follow when you are explaining the protocol to someone.
-//
-// With it off, scans happen only when a human picks persona menu -> "Scan now".
-//
-// WHAT THIS CHANGES, and it is not cosmetic: a scan is how a member ABSORBS the
-// revocation callbacks fired at them. Post flags do not depend on it — those come from
-// barrier settlement in the replica's own rebuild — but a banned member's own object is
-// only marked banned once THEY scan. So with automatic scanning off, a revoked member
-// keeps being able to post until someone clicks Scan now on their instance. In a demo
-// that is arguably clearer (you show the ban landing on a keystroke), but it is a real
-// behavioural difference from the protocol's intent, where scanning is continuous.
-//
-// Set PERSONAS_AUTO_SCAN=1 to restore the old loop.
+// Scanning on the public schedule (personasScanSchedule) is ON by default, because a scan
+// is how a member absorbs a ban, a badge or settled reputation, and a client that never
+// scans eventually cannot post (NUM_INTS_BEFORE_SCAN). PERSONAS_AUTO_SCAN=off leaves only
+// the persona menu's "Scan now".
 export function isAutoScanEnabled(): boolean {
   const raw = process.env.PERSONAS_AUTO_SCAN?.trim();
   // 'off' disables the idle catch-up entirely; anything else leaves it on. The default
@@ -168,30 +153,63 @@ export function startPersonaFlagLoops(): void {
   }
 
   if (!scanInterval && isAutoScanEnabled()) {
-    scanInterval = setInterval(() => {
-      drop(
-        (async () => {
-          for (const [groupId] of builtPersonasEngines()) {
-            // Only a joined member has callbacks to absorb, and only then is a scan
-            // record acceptable to the other replicas.
-            const conversation = window.ConversationController.get(groupId);
-            if (!conversation || !hasJoinedPersonaGroup(groupId)) {
-              continue;
-            }
-            // oxlint-disable-next-line no-await-in-loop
-            await sendPersonaScan(conversation).catch(error =>
-              log.error(`scan failed: ${toLogFormat(error)}`)
-            );
-          }
-        })()
-      );
-    }, SCAN_INTERVAL_MS);
+    scanInterval = setInterval(() => drop(runDueScans()), SCAN_TICK_MS);
+    drop(runDueScans());
   }
 
   log.info(
     `startPersonaFlagLoops: refresh every ${REFRESH_INTERVAL_MS}ms, ` +
       (isAutoScanEnabled()
-        ? `idle catch-up scan every ${SCAN_INTERVAL_MS / 3_600_000}h (scans also run on send)`
-        : 'idle catch-up scan OFF (PERSONAS_AUTO_SCAN=off)')
+        ? `scans once per ${scanEpochMs(process.env.PERSONAS_SCAN_EPOCH_MS) / 60_000} min epoch`
+        : 'scheduled scans OFF (PERSONAS_AUTO_SCAN=off)')
   );
+}
+
+// Each group's next scan: the epoch it belongs to and when in that epoch it runs.
+const scanSlots = new Map<string, { epoch: number; slotMs: number | null }>();
+let scanningDue = false;
+
+// Run every group's scan whose slot has come. A slot is drawn at random the first time an
+// epoch is seen, and cleared once used, so each group scans once per epoch.
+async function runDueScans(): Promise<void> {
+  if (scanningDue) {
+    return;
+  }
+  scanningDue = true;
+  try {
+    const epochMs = scanEpochMs(process.env.PERSONAS_SCAN_EPOCH_MS);
+    for (const [groupId, engine] of builtPersonasEngines()) {
+      // Only a joined member has callbacks to absorb, and only then is a scan record
+      // acceptable to the other replicas.
+      const conversation = window.ConversationController.get(groupId);
+      if (!conversation || !hasJoinedPersonaGroup(groupId)) {
+        continue;
+      }
+      const anchorMs = getBarrierSchedule(groupId)?.anchorMs ?? 0;
+      const now = Date.now();
+      const epoch = scanEpochAt(now, anchorMs, epochMs);
+      let slot = scanSlots.get(groupId);
+      if (slot?.epoch !== epoch) {
+        const random = randomBytes(4).readUInt32LE(0) / 2 ** 32;
+        slot = {
+          epoch,
+          // A sweep cut off by a restart blocks this member's posts until it ends.
+          slotMs: engine.isScanning()
+            ? now
+            : pickScanSlot(now, anchorMs, epochMs, random),
+        };
+        scanSlots.set(groupId, slot);
+      }
+      if (slot.slotMs == null || now < slot.slotMs) {
+        continue;
+      }
+      slot.slotMs = null;
+      // oxlint-disable-next-line no-await-in-loop
+      await drainPersonaScans(conversation).catch(error =>
+        log.error(`scheduled scan failed: ${toLogFormat(error)}`)
+      );
+    }
+  } finally {
+    scanningDue = false;
+  }
 }

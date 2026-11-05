@@ -8,13 +8,13 @@
 // Mirrors personas-messenger carriage.rs `INLINE_MARKER`: a record body is
 // `PZR2:<base64>`. A body without a marker is ordinary chatter.
 //
-// NINE markers. The split follows what the ENGINE already does: any record whose
+// TEN markers. The split follows what the ENGINE already does: any record whose
 // in-circuit identity is a pseudonym — or whose whole purpose is to prove something
 // WITHOUT naming its author — must also hide its Signal sender, or the envelope
 // re-identifies what the proof went to trouble to anonymise.
 //   - POSTS (`PZP2:`) ride the shared phantom identity.
-//   - POLLS (`PZQ2:`) ride the phantom, so the poll's CREATOR is anonymous, and carry a
-//     DISPLAY descriptor (question + option labels) so a recipient can draw the bubble.
+//   - POLLS (`PZQ2:`) ride the phantom, so the poll's CREATOR is anonymous. A recipient
+//     draws the bubble from the record itself (`pollDescriptorFromRecord`).
 //   - BALLOTS (`PZV2:`) ride the phantom. In-circuit the voter is
 //     `H(sk, poll.context())` with no nonce — one pseudonym per poll, hence one vote
 //     per member — so voting is PSEUDONYMOUS, not anonymous.
@@ -27,9 +27,11 @@
 //     an author is worthless if the envelope says who sent it.
 //   - BADGE PROOFS (`PZG2:`) ride the phantom, for the same reason: the point is that
 //     SOMEONE holds the credential, not who.
-//   - JOIN / SCAN (`PZR2:`) are sent ATTRIBUTABLY under the real account. Joins
-//     especially MUST be: the anti-Sybil / ban-evasion guarantee depends on one
-//     membership per real account, which an anonymous join would defeat.
+//   - SCANS (`PZS2:`) ride the phantom: when and how often a member scans follows their
+//     private tickets, so a named scan would identify their anonymous posts.
+//   - JOINS (`PZR2:`) are sent ATTRIBUTABLY under the real account. They MUST be: the
+//     anti-Sybil / ban-evasion guarantee depends on one membership per real account,
+//     which an anonymous join would defeat.
 //   - TOPIC ANNOUNCEMENTS (`PZT2:`) are not ZK records at all — coordination metadata
 //     mapping a topic name to its random context. The engine never sees them.
 // The record-bearing markers all yield the same CBOR bytes on decode (the engine
@@ -43,6 +45,8 @@ export const PERSONAS_VOTE_MARKER = 'PZV2:';
 // exactly like a vote), so they must ride the phantom too — otherwise the Signal
 // envelope names the rater and the in-circuit pseudonym is pointless.
 export const PERSONAS_RATE_MARKER = 'PZE2:';
+// Scans ride the phantom: see isPersonaPhantomBody.
+export const PERSONAS_SCAN_MARKER = 'PZS2:';
 // Topic announcements are NOT ZK records — see decodeTopicAnnouncement.
 export const PERSONAS_TOPIC_MARKER = 'PZT2:';
 
@@ -112,6 +116,7 @@ const PHANTOM_MARKERS = [
   PERSONAS_POLL_MARKER,
   PERSONAS_VOTE_MARKER,
   PERSONAS_RATE_MARKER,
+  PERSONAS_SCAN_MARKER,
   PERSONAS_BADGE_MARKER,
   PERSONAS_AUTHORSHIP_MARKER,
   PERSONAS_BADGE_PROOF_MARKER,
@@ -126,6 +131,7 @@ const ALL_MARKERS = [
   PERSONAS_POLL_MARKER,
   PERSONAS_VOTE_MARKER,
   PERSONAS_RATE_MARKER,
+  PERSONAS_SCAN_MARKER,
   PERSONAS_BADGE_MARKER,
 ] as const;
 
@@ -262,35 +268,41 @@ function parsePostEnvelope(
   }
 }
 
-// The DISPLAY metadata for a poll: what to draw in the bubble. The ZK record is the
-// authority for everything that matters — who may vote, whether a ballot is
-// well-formed, when the poll closes, and whether a ban settles are all decided by the
-// engine from the record. This descriptor only supplies the human-readable strings the
-// engine does not hand back, so a recipient can label the options it votes on.
-//
-// Treat it as UNTRUSTED: a peer could mislabel its own poll's options. That is a
-// display-integrity limit of the demo, not a soundness one — a mislabelled option
-// still resolves to the same option INDEX inside the proof, so the tally and any
-// resulting ban are exactly what the ZK system says they are.
+// What to draw in a poll bubble. Built from the POLL RECORD (`pollDescriptorFromRecord`),
+// never from anything else the sender supplies: nothing else binds to what the poll
+// actually does, so a bubble drawn from separate text could say "Lunch at noon?" while
+// the record is a ban poll whose first option is Ban.
 export type PersonaPollDescriptor = {
   question: string;
   options: ReadonlyArray<string>;
   kind: 'ban' | 'standard';
-  /**
-   * Do not RENDER a poll bubble for this poll on any client, including the sender's.
-   *
-   * The record is still sent, ingested and settled exactly as normal — this flag
-   * affects display only. It exists for an admin's permanent ban, where the decision is
-   * already made: showing the group a poll they appear to be able to vote in both
-   * misdescribes what happened and invites the Keep vote that would stop the ban from
-   * carrying.
-   *
-   * Suppressing it on the SENDER alone (hideFromTimeline) was not enough and is the bug
-   * this fixes: every recipient decodes the same record and builds its own poll bubble,
-   * so the poll stayed visible to everyone except the admin who cast it.
-   */
-  silent?: boolean;
 };
+
+// The labels of a ban poll, by option index. The replica counts option 0 as Ban and
+// option 1 as Keep whatever the record's own labels say.
+export const BAN_POLL_OPTIONS = ['Ban', 'Keep'] as const;
+const BAN_POLL_QUESTION = "Ban this post's author?";
+
+// A ban poll is always drawn with fixed wording, because its record's text is the
+// opener's own and only the record's KIND decides what its options do.
+export function pollDescriptorFromRecord(poll: {
+  question: string;
+  options: ReadonlyArray<string>;
+  kind: string;
+}): PersonaPollDescriptor {
+  if (poll.kind === 'ban') {
+    return {
+      question: BAN_POLL_QUESTION,
+      options: [...BAN_POLL_OPTIONS],
+      kind: 'ban',
+    };
+  }
+  return {
+    question: poll.question,
+    options: [...poll.options],
+    kind: 'standard',
+  };
+}
 
 // NOTE on poll_id. An earlier version of this carried a client-drawn random `pollId`,
 // on the assumption the voter's pseudonym was PRF(sk, poll_id) for a server-issued
@@ -306,79 +318,9 @@ export type PersonaPollDescriptor = {
 // and it has the same one-pseudonym-per-poll property because the derivation takes no
 // nonce. Carrying an extra random number would be dead weight that nothing enforces.
 
-// The wire shape behind PZQ2: the record plus the display descriptor.
-type PollEnvelope = {
-  // base64 record bytes
-  r: string;
-  q: string;
-  o: ReadonlyArray<string>;
-  k: 'ban' | 'standard';
-  // `s` for silent. Absent on every poll written before this existed, which decodes to
-  // `false` — the old, visible behaviour — so no older record changes meaning.
-  s?: boolean;
-};
-
-// Wrap a POLL record together with its display descriptor.
-export function encodePollBody(
-  bytes: Buffer | Uint8Array,
-  descriptor: PersonaPollDescriptor
-): string {
-  const envelope: PollEnvelope = {
-    r: Buffer.from(bytes).toString('base64'),
-    q: descriptor.question,
-    o: [...descriptor.options],
-    k: descriptor.kind,
-    // Only emitted when true, so an ordinary poll's bytes are unchanged.
-    ...(descriptor.silent ? { s: true } : {}),
-  };
-  return (
-    PERSONAS_POLL_MARKER +
-    Buffer.from(JSON.stringify(envelope), 'utf8').toString('base64')
-  );
-}
-
-function parsePollEnvelope(body: string): PollEnvelope | undefined {
-  try {
-    const json = Buffer.from(
-      body.slice(PERSONAS_POLL_MARKER.length),
-      'base64'
-    ).toString('utf8');
-    const parsed = JSON.parse(json) as PollEnvelope;
-    if (
-      typeof parsed?.r !== 'string' ||
-      typeof parsed?.q !== 'string' ||
-      !Array.isArray(parsed?.o)
-    ) {
-      return undefined;
-    }
-    return parsed;
-  } catch {
-    return undefined;
-  }
-}
-
-// The poll display descriptor behind a PZQ2 body, or undefined for anything else.
-export function decodePollDescriptor(
-  body: string | undefined | null
-): PersonaPollDescriptor | undefined {
-  if (!body?.startsWith(PERSONAS_POLL_MARKER)) {
-    return undefined;
-  }
-  const envelope = parsePollEnvelope(body);
-  if (!envelope) {
-    return undefined;
-  }
-  return {
-    question: envelope.q,
-    options: envelope.o.map(String),
-    kind: envelope.k === 'ban' ? 'ban' : 'standard',
-    // Only present when TRUE, so an ordinary poll decodes to exactly the object it did
-    // before this field existed. Always emitting `silent: false` changed the shape of
-    // every decoded descriptor, which broke a round-trip test — and that test was
-    // right: a display-only addition should be invisible to everything that does not
-    // ask for it.
-    ...(envelope.s === true ? { silent: true } : {}),
-  };
+// Wrap a POLL record. Its text is inside the record, so nothing rides beside it.
+export function encodePollBody(bytes: Buffer | Uint8Array): string {
+  return PERSONAS_POLL_MARKER + Buffer.from(bytes).toString('base64');
 }
 
 // The raw record bytes behind a body's marker (any of the three), or undefined for
@@ -394,10 +336,6 @@ export function decodeRecordBody(
     return undefined;
   }
   try {
-    if (marker === PERSONAS_POLL_MARKER) {
-      const envelope = parsePollEnvelope(body);
-      return envelope ? Buffer.from(envelope.r, 'base64') : undefined;
-    }
     if (marker === PERSONAS_POST_MARKER) {
       // A post is EITHER raw record bytes or a {r, b} envelope (see encodePostBody).
       // Unwrap when it is an envelope; otherwise fall through to the plain path. Getting
@@ -423,10 +361,11 @@ export function decodeRecordBody(
 // ballot would defeat the entire point of an anonymous poll, and an attributable poll
 // would expose who called for a revocation.
 //
-// JOINS AND SCANS deliberately do not, and the reason differs for each. A join must be
-// attributable because the anti-Sybil and ban-evasion guarantees rest on one membership
-// per real account. A scan is attributable because it is not a claim about anything —
-// it absorbs callbacks already addressed to this member.
+// JOINS deliberately do not: the anti-Sybil and ban-evasion guarantees rest on one
+// membership per real account. SCANS do: whether, when and how often a member scans
+// depends on that member's private tickets, so a scan under a real name points at their
+// anonymous posts, bans and badges. A scan creates no membership, so hiding its sender
+// costs the join accounting nothing.
 //
 // (An earlier version of this comment claimed ratings were attributable. They are not,
 // and never were in the code below — `member.rate` uses `context = target.context()`, so
@@ -657,6 +596,10 @@ export function encodeVoteBody(bytes: Buffer | Uint8Array): string {
 }
 
 // Wrap a RATE record. Like a ballot, it rides the phantom.
+export function encodeScanBody(bytes: Buffer | Uint8Array): string {
+  return PERSONAS_SCAN_MARKER + Buffer.from(bytes).toString('base64');
+}
+
 export function encodeRateBody(bytes: Buffer | Uint8Array): string {
   return PERSONAS_RATE_MARKER + Buffer.from(bytes).toString('base64');
 }

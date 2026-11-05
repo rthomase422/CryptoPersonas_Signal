@@ -24,6 +24,7 @@ import {
   PERSONAS_POLL_MARKER,
   PERSONAS_VOTE_MARKER,
   PERSONAS_RATE_MARKER,
+  PERSONAS_SCAN_MARKER,
   PERSONAS_TOPIC_MARKER,
   PERSONAS_BADGE_MARKER,
   PERSONAS_BADGE_PROOF_MARKER,
@@ -32,9 +33,10 @@ import {
   encodePostBody,
   encodePollBody,
   decodeRecordBody,
-  decodePollDescriptor,
+  pollDescriptorFromRecord,
   encodeVoteBody,
   encodeRateBody,
+  encodeScanBody,
   encodeTopicAnnouncement,
   decodeTopicAnnouncement,
   isPersonaPhantomBody,
@@ -57,7 +59,6 @@ import {
   PERSONAS_AUTHORSHIP_MARKER,
   decodePostBadge,
   decodePostContextName,
-  type PersonaPollDescriptor,
   PERSONAS_PHANTOM_BUNDLE_MARKER,
   encodePhantomBundle,
   decodePhantomBundle,
@@ -81,28 +82,43 @@ describe('personasCarriage', () => {
     });
 
     it('recovers the record bytes from a poll body', () => {
-      const descriptor: PersonaPollDescriptor = {
-        question: 'Revoke ~quiet-otter?',
-        options: ['Ban', 'Keep'],
-        kind: 'ban',
-      };
-      const body = encodePollBody(RECORD, descriptor);
+      const body = encodePollBody(RECORD);
       assert.isTrue(body.startsWith(PERSONAS_POLL_MARKER));
-      // The record must survive intact even though the body also carries display data.
       assert.deepEqual(decodeRecordBody(body), RECORD);
-      assert.deepEqual(decodePollDescriptor(body), descriptor);
     });
 
-    it('preserves poll option order, which decides what a ban vote means', () => {
-      // The engine settles a ban from the option INDEX, so a descriptor that
-      // reordered the labels in transit would invert the outcome.
-      const descriptor: PersonaPollDescriptor = {
-        question: 'q',
-        options: ['Ban', 'Keep', 'Abstain'],
+    it('recovers the record bytes from a scan body', () => {
+      const body = encodeScanBody(RECORD);
+      assert.isTrue(body.startsWith(PERSONAS_SCAN_MARKER));
+      assert.deepEqual(decodeRecordBody(body), RECORD);
+    });
+  });
+
+  describe('pollDescriptorFromRecord', () => {
+    it('keeps a standard poll as written', () => {
+      assert.deepEqual(
+        pollDescriptorFromRecord({
+          question: 'Lunch?',
+          options: ['Pizza', 'Tacos', 'Soup'],
+          kind: 'standard',
+        }),
+        {
+          question: 'Lunch?',
+          options: ['Pizza', 'Tacos', 'Soup'],
+          kind: 'standard',
+        }
+      );
+    });
+
+    it('cannot disguise a ban poll', () => {
+      const shown = pollDescriptorFromRecord({
+        question: 'Lunch at noon?',
+        options: ['Yes', 'No'],
         kind: 'ban',
-      };
-      const decoded = decodePollDescriptor(encodePollBody(RECORD, descriptor));
-      assert.deepEqual(decoded?.options, ['Ban', 'Keep', 'Abstain']);
+      });
+      assert.equal(shown.kind, 'ban');
+      assert.notInclude(shown.question, 'Lunch');
+      assert.deepEqual(shown.options, ['Ban', 'Keep']);
     });
   });
 
@@ -118,23 +134,12 @@ describe('personasCarriage', () => {
       assert.isUndefined(decodeRecordBody(`look at this ${PERSONAS_MARKER}abc`));
     });
 
-    it('returns undefined for a poll body with malformed JSON', () => {
-      const bogus =
-        PERSONAS_POLL_MARKER + Buffer.from('{not json', 'utf8').toString('base64');
-      assert.isUndefined(decodeRecordBody(bogus));
-      assert.isUndefined(decodePollDescriptor(bogus));
-    });
   });
 
   describe('isPersonaPhantomBody', () => {
     // This is the phantom-routing gate. Getting it wrong in either direction is a
     // correctness bug with privacy consequences, so both directions are asserted.
-    const poll = () =>
-      encodePollBody(RECORD, {
-        question: 'q',
-        options: ['a', 'b'],
-        kind: 'standard',
-      });
+    const poll = () => encodePollBody(RECORD);
 
     it('is true for the records whose author must be unlinkable', () => {
       // Posts, polls and ballots: an attributable poll would expose who called for a
@@ -145,6 +150,9 @@ describe('personasCarriage', () => {
       // A rating is pseudonymous in-circuit too (context = target.context()), so an
       // attributable envelope would name the rater outright.
       assert.isTrue(isPersonaPhantomBody(encodeRateBody(RECORD)));
+      // A scan: when and how often a member scans follows their private tickets, so a
+      // named scan would point at their anonymous posts.
+      assert.isTrue(isPersonaPhantomBody(encodeScanBody(RECORD)));
       // A badge request/approval: the grant travels by callback, so the sender's
       // identity is unused by the protocol and must not be published by the envelope.
       assert.isTrue(isPersonaPhantomBody(encodeBadgeBody(RECORD)));
@@ -159,8 +167,8 @@ describe('personasCarriage', () => {
     });
 
     it('is false for attributable records and plain chatter', () => {
-      // Joins and scans stay attributable: one membership per real account is what
-      // makes a ban impossible to evade by re-joining.
+      // Joins stay attributable: one membership per real account is what makes a ban
+      // impossible to evade by re-joining.
       assert.isFalse(isPersonaPhantomBody(encodeRecordBody(RECORD)));
       assert.isFalse(isPersonaPhantomBody('just a message'));
       assert.isFalse(isPersonaPhantomBody(undefined));

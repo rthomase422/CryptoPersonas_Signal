@@ -84,7 +84,10 @@ import {
 } from '../../util/cleanup.preload.ts';
 import { DataWriter } from '../../sql/Client.preload.ts';
 import { shouldSendToDirectConversation } from './shouldSendToConversation.preload.ts';
-import { encodePostBody } from '../../services/personasCarriage.std.ts';
+import {
+  encodePostBody,
+  isPersonaPhantomBody,
+} from '../../services/personasCarriage.std.ts';
 
 const { isNumber } = lodash;
 
@@ -667,9 +670,7 @@ async function getMessageSendData({
   // A persona POST uses the post marker so the group send splice routes it under the
   // shared phantom identity (attributable records use the plain marker instead).
   const personaRecordBase64 = message.get('personaRecordBase64');
-  // Phase 6: a poll's wire body is pre-encoded (it carries the display descriptor
-  // alongside the record, so it cannot be assembled from a bare base64 record here)
-  // and is deliberately NOT post-marked — a poll is attributable.
+  // Every other record's wire body is pre-encoded.
   const personaCarriageBody = message.get('personaCarriageBody');
   if (personaRecordBase64) {
     // Built through encodePostBody so a badge claim, when present, rides in the same
@@ -682,6 +683,11 @@ async function getMessageSendData({
     );
   } else if (personaCarriageBody) {
     body = personaCarriageBody;
+  }
+  // A sync transcript of an anonymous record would tell the Signal service, and this
+  // account's other devices, exactly who sent it.
+  if (isPersonaPhantomBody(body)) {
+    message.doNotSendSyncMessage = true;
   }
 
   const uploadQueue = new PQueue({

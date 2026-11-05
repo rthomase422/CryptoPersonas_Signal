@@ -587,6 +587,31 @@ async function sendToGroupViaSenderKey(
   }
 
   // 10. Send the Sender Key message!
+  // A multi-recipient envelope lists its recipients in the clear, so "the group minus me"
+  // would tell the service who sent a phantom record. Adding ourselves makes the list the
+  // same for every sender. Our own copy cannot be decrypted, since we already used that
+  // chain step, and MessageReceiver drops it. PERSONAS_SELF_RECIPIENT=0 turns this off.
+  if (
+    process.env.PERSONAS_SELF_RECIPIENT !== '0' &&
+    isPersonaContent(Proto.Content.encode(contentMessage), logId)
+  ) {
+    const ownDeviceId = itemStorage.user.getCheckedDeviceId();
+    const openOwnDevices = async (): Promise<Array<DeviceType>> =>
+      (await signalProtocolStore.getOpenDevices(ourAci, [ourAci])).devices;
+    let ownDevices = await openOwnDevices();
+    if (!ownDevices.some(device => device.id === ownDeviceId)) {
+      await fetchKeysForServiceId(
+        ourAci,
+        [ownDeviceId],
+        groupSendEndorsementState
+      );
+      ownDevices = await openOwnDevices();
+    }
+    devicesForSenderKey.push(...ownDevices);
+    senderKeyRecipients.push(ourAci);
+    log.info(`${logId}: added ${ownDevices.length} of our own devices`);
+  }
+
   let sendLogId: number;
   let senderKeyRecipientsWithDevices: Record<
     ServiceIdString,
@@ -1407,11 +1432,10 @@ async function encryptForSenderKey({
   );
 }
 
-// Does this Content carry a persona POST (the post marker in its DataMessage body,
-// see personasCarriage)? ONLY posts ride the shared phantom identity. Ordinary group
-// chatter AND attributable protocol records (join/vote/rate/poll/scan, plain marker)
-// keep the real per-member sender key + cert — joins in particular MUST stay
-// attributable so a banned member cannot silently re-join under the phantom.
+// Does this Content carry a body that rides the shared phantom identity (see
+// isPersonaPhantomBody)? Ordinary group chatter and joins keep the real per-member sender
+// key + cert — joins MUST stay attributable so a banned member cannot silently re-join
+// under the phantom.
 function isPersonaContent(
   encodedContent: Uint8Array<ArrayBuffer>,
   logId: string

@@ -602,3 +602,177 @@ fn verifying_with_a_prepared_key_gives_the_same_answers() {
         assert_eq!(ours, label == "valid", "{label}");
     }
 }
+
+/// Rewrite a record's content and re-encode it until `accept` likes its envelope hash.
+/// The `view` claim is outside every proof, so it grinds the hash for free.
+fn regrind(
+    bytes: &[u8],
+    mutate: &dyn Fn(&mut Record),
+    accept: &dyn Fn(Eh) -> bool,
+) -> (Vec<u8>, Eh) {
+    for k in 0u64.. {
+        let (mut rec, _) = super::record::decode(bytes).unwrap();
+        mutate(&mut rec);
+        let claim = super::record::ViewClaim {
+            barrier: k,
+            digest: [0; 32],
+        };
+        let (b, eh) = super::record::encode_with_view(&rec, Some(claim)).unwrap();
+        if accept(eh) {
+            return (b, eh);
+        }
+    }
+    unreachable!()
+}
+
+/// What the audit's content tests share: two joined members, and an honest post with its
+/// bytes, by the first of them.
+struct AuditSetup {
+    keys: ReplicaKeys,
+    joins: Vec<(F, Vec<u8>, Eh)>,
+    shadow: ObjT,
+    root: F,
+    voter: User<F, MsgUser>,
+    pred_pk: PK,
+    post: Vec<u8>,
+    post_eh: Eh,
+    rng: StdRng,
+}
+
+fn audit_setup() -> AuditSetup {
+    let mut rng = StdRng::seed_from_u64(77);
+    let (std_pk, std_vk) = standard_keys(&mut rng);
+    let (_scan_pk, scan_vk) = scan_keys(&mut rng, &CbT::new());
+    let (pred_pk, pred_vk) = pseudonym_pred_keys(&mut rng);
+    let keys = full_keys(&std_vk, &scan_vk, &pred_vk);
+    let mut author = member(&mut rng);
+    let voter = member(&mut rng);
+    let mut joins = vec![join_of(&author), join_of(&voter)];
+    joins.sort_by_key(|j| j.2);
+    let mut shadow = ObjT::new();
+    for (com, _, _) in &joins {
+        shadow.push(*com, F::from(0), vec![]);
+    }
+    let root = shadow.root();
+    let exec = author
+        .exec_method_create_cb::<H, F, FpVar<F>, (), (), Args, ArgsVar, Cr, Snark, ObjT, 1>(
+            &mut rng,
+            get_standard_interaction(),
+            [FakeSigPubkey::pk()],
+            Time::from(0),
+            &shadow,
+            false,
+            &std_pk,
+            F::from(0),
+            (),
+        )
+        .expect("post proof");
+    let post = Record::Post {
+        flavour: Flavour::Anon,
+        exec: Ark(exec),
+        extra: Ark(vec![]),
+        body: "honest text".into(),
+        obj_root: Ark(root),
+    };
+    let (post, post_eh) = encode(&post).unwrap();
+    AuditSetup {
+        keys,
+        joins,
+        shadow,
+        root,
+        voter,
+        pred_pk,
+        post,
+        post_eh,
+        rng,
+    }
+}
+
+fn audit_replica(s: &AuditSetup) -> Replica<OH, MH, NH> {
+    let config = Config {
+        root_window: 256,
+        settlement_barriers: 3,
+        poll_close_barriers: 1,
+    };
+    let mut r = Replica::<OH, MH, NH>::new(s.keys.clone(), config).trust_unproven_joins_for_tests();
+    for j in &s.joins {
+        r.ingest_at(j.1.clone(), 0).unwrap();
+    }
+    r
+}
+
+/// Audit C1: a member keeps a post's proof, changes its text and grinds a smaller hash.
+/// The forgery has to be refused, and the author's post has to stand.
+#[test]
+#[ignore = "audit C1: open until payloads are public inputs (real proofs; --release)"]
+fn a_post_body_cannot_be_rewritten_under_its_proof() {
+    let s = audit_setup();
+    let honest = s.post_eh;
+    let (forged, forged_eh) = regrind(
+        &s.post,
+        &|r| {
+            if let Record::Post { body, .. } = r {
+                *body = "FORGED text".into();
+            }
+        },
+        &|eh| eh < honest,
+    );
+    let mut r = audit_replica(&s);
+    r.ingest_at(s.post.clone(), 0).unwrap();
+    r.ingest_at(forged, 0).unwrap();
+    assert_eq!(r.status(&honest), Some(Status::Applied));
+    assert!(matches!(r.status(&forged_eh), Some(Status::Rejected(_))));
+}
+
+/// Audit C1: changing a ballot's option under its proof must not change the tally.
+#[test]
+#[ignore = "audit C1: open until payloads are public inputs (real proofs; --release)"]
+fn a_ballot_cannot_be_flipped_under_its_proof() {
+    let mut s = audit_setup();
+    let poll = Record::PollOpen {
+        question: "ban?".into(),
+        options: vec!["ban".into(), "keep".into()],
+        kind: PollKind::Ban,
+        target: Some(s.post_eh),
+    };
+    let (poll_bytes, poll_eh) = encode(&poll).unwrap();
+    let (vote, vote_eh) = ban_vote(
+        &mut s.rng,
+        &s.voter,
+        &s.shadow,
+        s.root,
+        poll_eh,
+        &s.pred_pk,
+    );
+    let (flipped, _) = regrind(
+        &vote,
+        &|r| {
+            if let Record::Vote { option, .. } = r {
+                *option = super::tally::KEEP_OPTION;
+            }
+        },
+        &|eh| eh > vote_eh,
+    );
+    let mut r = audit_replica(&s);
+    r.ingest_at(s.post.clone(), 0).unwrap();
+    r.ingest_at(poll_bytes, 0).unwrap();
+    r.ingest_at(vote, 0).unwrap();
+    assert_eq!(r.poll(&poll_eh).unwrap().ban_tally(), (1, 0));
+    r.ingest_at(flipped, 0).unwrap();
+    assert_eq!(r.poll(&poll_eh).unwrap().ban_tally(), (1, 0));
+}
+
+/// Beyond the audit: a Groth16 proof can be re-randomized and `view` is outside it, so a
+/// copy of a post with the SAME text can still take a smaller hash. Bans and ratings
+/// aimed at the original must keep working, so that copy has to be the same record.
+#[test]
+#[ignore = "open until a record's identity excludes its proof bytes and view (real proofs; --release)"]
+fn a_recoded_copy_of_a_post_does_not_displace_it() {
+    let s = audit_setup();
+    let honest = s.post_eh;
+    let (copy, _) = regrind(&s.post, &|_| {}, &|eh| eh < honest);
+    let mut r = audit_replica(&s);
+    r.ingest_at(s.post.clone(), 0).unwrap();
+    r.ingest_at(copy, 0).unwrap();
+    assert_eq!(r.status(&honest), Some(Status::Applied));
+}
