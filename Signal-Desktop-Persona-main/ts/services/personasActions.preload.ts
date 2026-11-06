@@ -80,7 +80,7 @@ export async function sendPersonaRate(
     return false;
   }
   try {
-    if (!(await ensureReadyForPersonaAction(conversation))) {
+    if (!(await ensureReadyToProveIdentity(conversation))) {
       log.warn('sendPersonaRate: not joined; refusing to rate');
       return false;
     }
@@ -126,7 +126,7 @@ export async function sendPersonaPoll(
     return undefined;
   }
   try {
-    if (!(await ensureReadyForPersonaAction(conversation))) {
+    if (!(await ensureReadyForUnprovenRecord(conversation))) {
       log.warn('sendPersonaPoll: not joined; refusing to open a poll');
       return undefined;
     }
@@ -205,8 +205,8 @@ export async function sendPersonaBanPoll(
  *
  * At the next settlement barrier every replica invokes the post's callback with
  * BAN_FLAG, so the author's posts are flagged for everyone; the author's next scan
- * (which runs before every persona action) writes the ban into their object, and their
- * persona proofs stop being satisfiable. Nobody can vote it down.
+ * writes the ban into their object, and their posts stop being provable. Nobody can
+ * vote it down.
  *
  * Sent under the admin's OWN account (the plain record marker, not the phantom), and
  * every member ingests it only from a Signal group admin (personasReset
@@ -225,7 +225,7 @@ export async function sendPersonaBan(
     return false;
   }
   try {
-    if (!(await ensureReadyForPersonaAction(conversation))) {
+    if (!(await ensureReadyForUnprovenRecord(conversation))) {
       log.warn('sendPersonaBan: not joined; refusing to ban');
       return false;
     }
@@ -257,7 +257,7 @@ export async function sendPersonaVote(
     return false;
   }
   try {
-    if (!(await ensureReadyForPersonaAction(conversation))) {
+    if (!(await ensureReadyToProveIdentity(conversation))) {
       log.warn('sendPersonaVote: not joined; refusing to vote');
       return false;
     }
@@ -347,10 +347,8 @@ function rateDeltaForEmoji(emoji: string): number | undefined {
 // true (the caller then skips the ordinary Signal reaction). Anything else returns
 // false and falls through untouched.
 //
-// `remove` inverts the delta: un-thumbs-upping is a -1, which is the closest the
-// engine's append-only rating model gets to a retraction. Ratings accumulate, so this
-// nets back to zero rather than deleting the original ballot — appropriate for a
-// system whose whole point is that history is not rewritten.
+// A rating cannot be taken back: the replica counts one per member per post, so a second
+// record would be dropped and the toast would claim something that never happened.
 // `handled` means "this was a thumbs on a persona post, so do NOT fall through to an
 // ordinary Signal reaction". `sent` reports whether the rate record actually went out.
 //
@@ -452,12 +450,15 @@ export async function maybeSendPersonaRateForReaction({
     return NOT_OURS;
   }
 
-  const applied = delta * (remove ? -1 : 1);
+  if (remove) {
+    log.info('maybeSendPersonaRateForReaction: a rating cannot be withdrawn');
+    return { handled: true, sent: false, delta: 0 };
+  }
   log.info(
-    `maybeSendPersonaRateForReaction: routing ${emoji} to a rate of ${applied}`
+    `maybeSendPersonaRateForReaction: routing ${emoji} to a rate of ${delta}`
   );
-  const sent = await sendPersonaRate(conversation, targetEh, applied);
-  return { handled: true, sent, delta: applied };
+  const sent = await sendPersonaRate(conversation, targetEh, delta);
+  return { handled: true, sent, delta };
 }
 
 // Emit a scan, absorbing the revocation callbacks fired since our last one. This is
@@ -530,13 +531,14 @@ async function clearOfBarrier(
 // Prove, check and release one scan. Returns the record to send, or undefined if every
 // attempt went stale. Throws "nothing to scan" when nothing is outstanding.
 async function produceValidScan(
-  groupId: string
+  groupId: string,
+  dummy: boolean
 ): Promise<{ eh: string; body: string } | undefined> {
   for (let attempt = 1; attempt <= MAX_SCAN_ATTEMPTS; attempt += 1) {
     // oxlint-disable-next-line no-await-in-loop
     await clearOfBarrier(groupId, lastScanProofMs + SEND_MARGIN_MS, SETTLE_MS);
     const started = Date.now();
-    if (preparePersonaScan(groupId) === undefined) {
+    if (preparePersonaScan(groupId, dummy) === undefined) {
       return undefined;
     }
     lastScanProofMs = Date.now() - started;
@@ -636,12 +638,61 @@ export async function ensureReadyForPersonaAction(
   if (getPersonasEngine(groupIdOf(conversation))?.isScanning()) {
     return drainPersonaScans(conversation);
   }
+  return waitUntilSettled(conversation);
+}
+
+// A vote or a rating needs a settled object, but not the newest, so it does not wait for
+// the member's last action, and a sweep under way does not hold it up either.
+async function ensureReadyToProveIdentity(
+  conversation: ConversationModel
+): Promise<boolean> {
+  if (!(await ensureReadyForUnprovenRecord(conversation))) {
+    return false;
+  }
+  const engine = getPersonasEngine(groupIdOf(conversation));
+  return engine?.canProveIdentity() === true || waitUntilSettled(conversation);
+}
+
+// A poll, a ban or an approval carries no proof, so settling does not concern it. It only
+// has to stay out of the way of a scan being released.
+export async function ensureReadyForUnprovenRecord(
+  conversation: ConversationModel
+): Promise<boolean> {
+  if (!(await ensurePersonaJoined(conversation))) {
+    return false;
+  }
+  if (scanInFlight) {
+    await scanFinished;
+  }
+  return true;
+}
+
+// A proof names a settled root, so a member's new object can be proved from only once its
+// barrier has settled, a few seconds into the barrier after the action that made it.
+const SETTLE_POLL_MS = 250;
+
+async function waitUntilSettled(conversation: ConversationModel): Promise<boolean> {
+  const groupId = groupIdOf(conversation);
+  const engine = getPersonasEngine(groupId);
+  if (!engine) {
+    return false;
+  }
+  const periodMs = getBarrierSchedule(groupId)?.periodMs ?? 10_000;
+  const deadline = Date.now() + 4 * periodMs;
+  while (!engine.isSettled()) {
+    if (Date.now() > deadline) {
+      log.warn('waitUntilSettled: our last action has not settled');
+      return false;
+    }
+    // oxlint-disable-next-line no-await-in-loop
+    await sleep(SETTLE_POLL_MS);
+  }
   return true;
 }
 
 export async function drainPersonaScans(
   conversation: ConversationModel,
-  { maxRounds }: { maxRounds?: number } = {}
+  { maxRounds, onScan }: { maxRounds?: number; onScan?: () => void } = {}
 ): Promise<boolean> {
   if (!isPersonasEngineEnabled()) {
     return true;
@@ -679,6 +730,7 @@ export async function drainPersonaScans(
       log.error('drainPersonaScans: a scan could not be made; refusing the send');
       return false;
     }
+    onScan?.();
     const after = engine.isScanning() ? engine.sweepRemaining() : 0;
     if (after >= before) {
       log.error(
@@ -692,11 +744,48 @@ export async function drainPersonaScans(
   return false;
 }
 
+/**
+ * A member's scans for one epoch: finish whatever real scanning is due, then send dummy
+ * scans up to `count`, so every member sends the same number. See personasScanSchedule.
+ */
+export async function runScheduledScans(
+  conversation: ConversationModel,
+  count: number
+): Promise<void> {
+  const engine = getPersonasEngine(groupIdOf(conversation));
+  if (!engine) {
+    return;
+  }
+  let sent = 0;
+  await drainPersonaScans(conversation, {
+    onScan: () => {
+      sent += 1;
+    },
+  });
+  for (; sent < count; sent += 1) {
+    // Never while a sweep runs, which a "Scan now" press can start at any moment.
+    if (engine.isScanning()) {
+      return;
+    }
+    // Each scan waits for the one before it to settle, which spaces them out.
+    // oxlint-disable-next-line no-await-in-loop
+    if (!(await sendPersonaScan(conversation, { quiet: true, dummy: true }))) {
+      log.warn(`runScheduledScans: stopped after ${sent} of ${count} scans`);
+      return;
+    }
+  }
+}
+
 export async function sendPersonaScan(
   conversation: ConversationModel,
-  { quiet = false }: { quiet?: boolean } = {}
+  { quiet = false, dummy = false }: { quiet?: boolean; dummy?: boolean } = {}
 ): Promise<boolean> {
   if (!isPersonasEngineEnabled()) {
+    return false;
+  }
+  // Each scan moves the object, so the one before it has to settle first. Not counted as
+  // a scan in flight: nothing else needs to wait for this.
+  if (!(await waitUntilSettled(conversation))) {
     return false;
   }
   if (scanInFlight) {
@@ -723,7 +812,7 @@ export async function sendPersonaScan(
     }
     // A scan is only meaningful once we are a member, but unlike the others it should
     // not CAUSE a join — a lurking instance that never posted has nothing to absorb.
-    const scan = await produceValidScan(groupId);
+    const scan = await produceValidScan(groupId, dummy);
     if (!scan) {
       return false;
     }

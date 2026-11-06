@@ -673,14 +673,7 @@ async function getMessageSendData({
   // Every other record's wire body is pre-encoded.
   const personaCarriageBody = message.get('personaCarriageBody');
   if (personaRecordBase64) {
-    // Built through encodePostBody so a badge claim, when present, rides in the same
-    // envelope shape the receive path knows how to unwrap. With no badge this produces
-    // byte-identical output to the old string concatenation.
-    body = encodePostBody(
-      Buffer.from(personaRecordBase64, 'base64'),
-      message.get('personaBadge'),
-      message.get('personaContextName')
-    );
+    body = encodePostBody(Buffer.from(personaRecordBase64, 'base64'));
   } else if (personaCarriageBody) {
     body = personaCarriageBody;
   }

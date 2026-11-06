@@ -13,7 +13,7 @@ use personas_core::F;
 /// A concrete, small height so the const generics are pinned (the proof-free tests
 /// never touch a key, so the heights are immaterial — small just keeps the
 /// per-ingest rebuild's Poseidon count low in a debug build).
-type TestReplica = Replica<4, 4, 4>;
+type TestReplica = Replica<32, 4, 4>;
 
 /// A `Join` committing the object `x` (its value is opaque to the engine, which
 /// only appends it to the tree).
@@ -23,6 +23,7 @@ fn join(x: u64) -> (Vec<u8>, super::record::Eh) {
         old_nul: Ark(F::from(1_000_000 + x)),
         // Distinct accounts (one join each). No proof: these replicas trust joins.
         account: Ark(F::from(2_000_000 + x)),
+        pk: Ark(F::from(3_000_000 + x)),
         proof: Ark(Default::default()),
     };
     encode(&rec).unwrap()
@@ -31,7 +32,9 @@ fn join(x: u64) -> (Vec<u8>, super::record::Eh) {
 /// A replica with placeholder keys — fine because these tests only ingest records
 /// that carry no proof, so no key is ever touched.
 fn replica() -> TestReplica {
-    TestReplica::new(placeholder_keys(), Config::default()).trust_unproven_joins_for_tests()
+    TestReplica::new(placeholder_keys(), Config::fast())
+        .trust_unproven_joins_for_tests()
+        .admit_unproven_for_tests()
 }
 
 /// A `ReplicaKeys` whose verifying keys are default/empty — never used by the
@@ -46,7 +49,8 @@ fn placeholder_keys() -> super::ReplicaKeys {
         scan: vk.clone(),
         pseudonym_pred: vk.clone(),
         badge_request: vk.clone(),
-        join: vk,
+        join: vk.clone(),
+        not_banned: vk,
     }
 }
 
@@ -172,7 +176,7 @@ fn advance_to_closes_a_ban_poll_on_cadence() {
     // The heartbeat's settle trigger: a poll opened at barrier 0 closes once the replica
     // reaches `poll_close_barriers`, and not before.
     let (poll, eh) = ban_poll();
-    let config = Config::default();
+    let config = Config::fast();
     let close = config.poll_close_barriers;
     let mut r =
         Replica::<4, 4, 4>::new(placeholder_keys(), config).trust_unproven_joins_for_tests();
@@ -217,7 +221,7 @@ fn the_journal_survives_a_restart() {
 
     let root;
     {
-        let mut r = TestReplica::open(&path, placeholder_keys(), Config::default())
+        let mut r = TestReplica::open(&path, placeholder_keys(), Config::fast())
             .unwrap()
             .trust_unproven_joins_for_tests();
         r.ingest(a.clone()).unwrap();
@@ -226,7 +230,7 @@ fn the_journal_survives_a_restart() {
     }
 
     // Reopen: the journal replays the same records into the same tree.
-    let reopened = TestReplica::open(&path, placeholder_keys(), Config::default())
+    let reopened = TestReplica::open(&path, placeholder_keys(), Config::fast())
         .unwrap()
         .trust_unproven_joins_for_tests();
     assert_eq!(reopened.obj_root(), root, "replay reproduces the root");
@@ -265,7 +269,7 @@ fn checkpointed_rebuilds_match_a_full_replay_across_a_long_schedule() {
     records.push((148, late));
     r.advance_to(151);
 
-    let fresh = TestReplica::from_records(placeholder_keys(), Config::default(), records, 151)
+    let fresh = TestReplica::from_records(placeholder_keys(), Config::fast(), records, 151)
         .trust_unproven_joins_for_tests();
     assert_eq!(r.obj_root(), fresh.obj_root());
     assert_eq!(r.status(&late_eh), Some(Status::Applied));
@@ -435,7 +439,7 @@ fn a_relay_cannot_carry_a_sender_checked_record() {
 #[test]
 fn a_relay_cannot_move_a_record_the_service_delivered() {
     let bytes = claiming(1, None);
-    let eh = super::record::Eh::of_bytes(&bytes);
+    let eh = super::record::decode(&bytes).unwrap().1;
     let mut r = replica();
     r.ingest_at(bytes.clone(), 2).unwrap();
     let before = r.view_digest(5);
@@ -459,14 +463,12 @@ fn claims_too_recent_to_check_are_pending() {
     assert_eq!((report.pending, report.diverged()), (1, false));
 }
 
-/// Audit H1/H2: a record backdated into an earlier barrier replays that barrier, and a
-/// root other records already named must not stop being produced when it does.
+/// Audit H1/H2: a root a proof may name must not stop being produced because a record
+/// stamped in the barrier after it arrives late, and a same-barrier race cannot change it.
 #[test]
-#[ignore = "audit H1/H2: open until proofs name settled roots"]
-fn a_backdated_record_does_not_unproduce_a_root() {
+fn a_late_record_does_not_unproduce_a_settled_root() {
     let mut r = replica();
-    let a = join(1);
-    r.ingest_at(a.0.clone(), 0).unwrap();
+    r.ingest_at(join(1).0, 0).unwrap();
     r.advance_to(1);
     let y = join(2);
     let mut candidate = 3;
@@ -478,11 +480,18 @@ fn a_backdated_record_does_not_unproduce_a_root() {
         candidate += 1;
     };
     r.ingest_at(y.0.clone(), 1).unwrap();
-    let root_after_y = r.obj_root();
-    assert!(r.has_produced_root(root_after_y));
-    r.advance_to(2);
-    assert!(r.has_produced_root(root_after_y));
-    // X arrives late, stamped into barrier 1.
-    r.ingest_at(x.0.clone(), 1).unwrap();
-    assert!(r.has_produced_root(root_after_y));
+    let mid_barrier = r.obj_root();
+    assert!(
+        !r.has_produced_root(mid_barrier),
+        "an open barrier's root cannot be named"
+    );
+    r.advance_to(3);
+    let settled = r.proving_store().expect("barrier 1 has settled").root();
+    assert_eq!(settled, mid_barrier);
+    assert!(r.has_produced_root(settled));
+
+    // X was stamped into barrier 2, and reaches us a full barrier later.
+    r.ingest_at(x.0.clone(), 2).unwrap();
+    assert!(r.has_produced_root(settled), "the settled root stands");
+    assert_eq!(r.proving_store().unwrap().root(), settled);
 }

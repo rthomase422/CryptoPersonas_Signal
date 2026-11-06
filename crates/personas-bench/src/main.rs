@@ -38,7 +38,7 @@ use std::time::Instant;
 
 use personas_bulletin::merkle::params::ensure_merkle_keys;
 use personas_bulletin::replica::record::PollKind;
-use personas_bulletin::replica::{Config, ReplicaKeys};
+use personas_bulletin::replica::{Config, ReplicaKeys, SETTLE_LAG};
 use personas_core::{F, PreparedVk};
 use personas_messenger::{Emitted, Member, MemberKeys, Messenger, carriage};
 use rand::SeedableRng;
@@ -329,7 +329,7 @@ impl Group {
                 transport.clone(),
                 conv.clone(),
                 replica_keys.clone(),
-                Config::default(),
+                Config::fast(),
                 Some(Member::create(member_keys.clone(), rng)),
             )
         };
@@ -361,6 +361,7 @@ impl Group {
             .expect("join");
             group.deliver_all_but(who, &e);
         }
+        group.settle_all();
         group
     }
 
@@ -426,6 +427,11 @@ impl Group {
         }
     }
 
+    /// Cross barriers until the record just sent is in a root its sender can prove from.
+    fn settle_all(&mut self) {
+        self.barrier_all(SETTLE_LAG as usize);
+    }
+
     /// Pre-fill the group's history with `n` records (anonymous posts from Carol, a few
     /// per barrier), so record handling is measured against a group that has been in use.
     fn prefill(&mut self, n: usize) {
@@ -441,11 +447,9 @@ impl Group {
             }
             .expect("post");
             self.deliver_all_but(poster, &e);
-            if i % 3 == 2 {
-                self.barrier_all(1);
-            }
-            if i % 150 == 149 {
-                self.barrier_all(Config::default().settlement_barriers as usize + 1);
+            self.settle_all();
+            if i % 24 == 23 {
+                self.barrier_all(Config::fast().settlement_barriers as usize + 1);
                 for who in [Who::Bob, Who::Carol] {
                     let mut rounds = 0;
                     while self.engine(who).scan_needed() && rounds < 400 {
@@ -457,11 +461,12 @@ impl Group {
                         }
                         .expect("scan");
                         self.deliver_all_but(who, &e);
+                        self.settle_all();
                     }
                 }
             }
         }
-        self.barrier_all(Config::default().settlement_barriers as usize + 1);
+        self.barrier_all(Config::fast().settlement_barriers as usize + 1);
         eprintln!(
             "history: {n} records in {:.1}s",
             started.elapsed().as_secs_f64()
@@ -472,17 +477,15 @@ impl Group {
     /// carries `k` outstanding callbacks; returns it with the replica's stores.
     fn fold_subject(&mut self, k: usize) -> fold::Subject {
         let started = Instant::now();
-        for i in 0..k {
+        for _ in 0..k {
             let e = self
                 .alice
                 .emit_post_anon(&mut self.rng, "fold")
                 .expect("post");
             self.deliver_all_but(Who::Alice, &e);
-            if i % 3 == 2 {
-                self.barrier_all(1);
-            }
+            self.settle_all();
         }
-        self.barrier_all(Config::default().settlement_barriers as usize + 1);
+        self.barrier_all(Config::fast().settlement_barriers as usize + 1);
         let member = self.alice.member().expect("alice is a member");
         let replica = self.alice.replica();
         eprintln!(
@@ -500,13 +503,14 @@ impl Group {
     /// Let every outstanding ticket settle, then have Alice absorb everything with scans
     /// (each one a scan sample). Keeps her clear of the interaction cap between batches.
     fn settle_and_drain(&mut self, scans: &mut Samples) {
-        self.barrier_all(Config::default().settlement_barriers as usize + 1);
+        self.barrier_all(Config::fast().settlement_barriers as usize + 1);
         let mut rounds = 0;
         while self.alice.scan_needed() && rounds < 400 {
             rounds += 1;
             let e = self.alice.emit_scan(&mut self.rng).expect("scan");
             self.record_emit(scans);
             self.receive_timed(&e, scans);
+            self.settle_all();
         }
     }
 }
@@ -540,7 +544,7 @@ fn run_ops(args: &Args, keys_dir: &std::path::Path) -> BTreeMap<String, OpResult
                 g.transport.clone(),
                 g.conv.clone(),
                 g.replica_keys.clone(),
-                Config::default(),
+                Config::fast(),
                 Some(Member::create(g.member_keys.clone(), &mut g.rng)),
             );
             let account = g.account();
@@ -572,6 +576,10 @@ fn run_ops(args: &Args, keys_dir: &std::path::Path) -> BTreeMap<String, OpResult
                       scans: &mut Samples| {
         let mut s = Samples::default();
         for i in 0..total {
+            // A member must finish a sweep every NUM_INTS_BEFORE_SCAN interactions.
+            if g.alice.scan_required() {
+                g.settle_and_drain(scans);
+            }
             let e = emit(g, i);
             let mut tmp = Samples::default();
             g.record_emit(&mut tmp);
@@ -584,8 +592,8 @@ fn run_ops(args: &Args, keys_dir: &std::path::Path) -> BTreeMap<String, OpResult
                 s.handle.extend(tmp.handle);
             }
             // The app's barriers are 10 s, so a barrier holds a record or two, not a
-            // whole batch: give each operation its own, as there.
-            g.barrier_all(1);
+            // whole batch, and a member's next action waits for its last one to settle.
+            g.settle_all();
         }
         g.settle_and_drain(scans);
         eprintln!("{name}: done");
@@ -722,6 +730,7 @@ fn run_ops(args: &Args, keys_dir: &std::path::Path) -> BTreeMap<String, OpResult
             .emit_badge_approve(req.eh, slot as u8)
             .expect("approve");
         g.deliver_all_but(Who::Bob, &approve);
+        g.settle_all();
         g.settle_and_drain(&mut scans);
         let mut s = Samples::default();
         for i in 0..total {
@@ -777,6 +786,7 @@ fn run_ops(args: &Args, keys_dir: &std::path::Path) -> BTreeMap<String, OpResult
             for _ in 0..(total - scans.prove.len()) {
                 let e = g.alice.emit_post_anon(&mut g.rng, "ticket").expect("post");
                 g.deliver_all_but(Who::Alice, &e);
+                g.settle_all();
             }
             g.settle_and_drain(&mut scans);
         }
@@ -795,7 +805,7 @@ fn run_ops(args: &Args, keys_dir: &std::path::Path) -> BTreeMap<String, OpResult
         // An admin's permanent ban: Carol posts, Bob bans the post, one barrier later the
         // post's callback is invoked (post callback) and the epoch is updated. Carol never
         // scans, so she can keep posting.
-        g.barrier_all(Config::default().settlement_barriers as usize + 1);
+        g.barrier_all(Config::fast().settlement_barriers as usize + 1);
         let mut s = Samples::default();
         for i in 0..total {
             let post = g
@@ -818,6 +828,7 @@ fn run_ops(args: &Args, keys_dir: &std::path::Path) -> BTreeMap<String, OpResult
                     .push(t.invoke_us / u64::from(t.invoked));
                 s.epoch_update.push(t.epoch_update_us);
             }
+            g.barrier_all(SETTLE_LAG as usize - 1);
         }
         results.insert("moderation".into(), s);
         eprintln!("moderation: done");

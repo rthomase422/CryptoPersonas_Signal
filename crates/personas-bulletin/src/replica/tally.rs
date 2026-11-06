@@ -61,16 +61,19 @@ pub struct Poll {
     /// The barrier index at which the poll opened; it closes at
     /// `opened_barrier + close_barriers`.
     pub opened_barrier: u64,
-    /// `claimed` (keyed) → chosen option. One member, one vote; a later ballot
-    /// from the same `claimed` replaces the earlier one, matching `PollLog::cast`.
+    /// `claimed` (keyed) → chosen option. One member, one vote: the first ballot from a
+    /// `claimed` stands, in log order.
     pub ballots: HashMap<[u8; 32], u32>,
     pub closed: bool,
 }
 
 impl Poll {
-    /// Record (or replace) a ballot.
+    /// Record a ballot, unless this `claimed` has already voted.
+    ///
+    /// A ballot is not replaceable: a later one could wait until the poll's last moment
+    /// to change the result, and the client offers no way to recast anyway.
     pub fn cast(&mut self, claimed: F, option: u32) {
-        self.ballots.insert(f_key(claimed), option);
+        self.ballots.entry(f_key(claimed)).or_insert(option);
     }
 
     /// `(yes, no)` for a ban poll — bans versus keeps, ignoring anything else.
@@ -106,6 +109,10 @@ impl Poll {
 // Outstanding tickets (the settlement set)
 // ---------------------------------------------------------------------------------------
 
+/// The most a single post can move its author's reputation, either way. Keeps the
+/// settlement argument far from every flag value (`BAN_FLAG` and the badge flags).
+pub const R_MAX: i64 = 1_000_000;
+
 /// A post's outstanding callback ticket and the state that decides how it settles.
 ///
 /// Every post files exactly one ticket (`NUMCBS = 1`), called exactly once at its
@@ -121,8 +128,10 @@ pub struct Outstanding {
     pub filed_at: Time<F>,
     /// The barrier by which the ticket must be retired.
     pub settle_barrier: u64,
-    /// Net ratings accrued on this post, clamped at zero when read (a negative
-    /// reputation would wrap past every threshold in-circuit).
+    /// The pseudonym the post was made under (`f_key` of `claimed`); `None` for an
+    /// anonymous post or a badge request, which link to nothing.
+    pub claimed: Option<[u8; 32]>,
+    /// Net ratings accrued on this post, clamped to `±R_MAX` when read.
     pub accrued: i64,
     /// A ban trigger (poll close or admin invoke) has landed for this post.
     pub banned: bool,
@@ -138,11 +147,17 @@ pub struct Outstanding {
 }
 
 impl Outstanding {
-    pub fn new(callback: Callback, filed_at: Time<F>, settle_barrier: u64) -> Self {
+    pub fn new(
+        callback: Callback,
+        filed_at: Time<F>,
+        settle_barrier: u64,
+        claimed: Option<[u8; 32]>,
+    ) -> Self {
         Self {
             callback,
             filed_at,
             settle_barrier,
+            claimed,
             accrued: 0,
             banned: false,
             badge_slot: None,
@@ -150,9 +165,10 @@ impl Outstanding {
         }
     }
 
-    /// The reputation to settle with, clamped to `[0, ..]`.
+    /// The reputation to settle with, clamped to `[-R_MAX, R_MAX]`. Negative feedback
+    /// counts: `arg_rep` carries a negative value and the circuit adds it.
     pub fn clamped_rep(&self) -> i64 {
-        self.accrued.max(0)
+        self.accrued.clamp(-R_MAX, R_MAX)
     }
 }
 
@@ -202,6 +218,16 @@ pub struct Derived {
     pub joins: HashMap<[u8; 32], u32>,
     /// Admin-approved extra joins per account.
     pub rejoin_allowance: HashMap<[u8; 32], u32>,
+    /// The one public key each account joins with, and the account each key belongs to.
+    pub account_pk: HashMap<[u8; 32], [u8; 32]>,
+    pub pk_account: HashMap<[u8; 32], [u8; 32]>,
+    /// Pseudonyms a ban has reached. A later post under one is flagged on sight and its
+    /// ticket is called with the ban.
+    pub banned_personas: HashSet<[u8; 32]>,
+    /// The tickets and polls still open, so a barrier's work follows what is open now
+    /// rather than the whole history. A long ban window means many barriers per ticket.
+    pub open_tickets: HashSet<Eh>,
+    pub open_polls: HashSet<Eh>,
 }
 
 impl Derived {
@@ -212,6 +238,46 @@ impl Derived {
             .entry(f_key(claimed))
             .or_insert_with(|| persona::petname(claimed))
             .clone()
+    }
+
+    /// Land a ban on a post, from an admin or a passed poll.
+    ///
+    /// An unsettled ticket takes the ban directly. A settled one has already been spent,
+    /// so for a pseudonymous post the ban moves to the newest unsettled ticket under the
+    /// same pseudonym: posts under one `claimed` are provably one member, and the ban
+    /// lands on the member's object, so any of their tickets will do. If none is
+    /// outstanding the pseudonym stays marked and their next post carries the ban.
+    ///
+    /// An anonymous post links to nothing, so a settled one is out of reach.
+    pub fn ban(&mut self, target: Eh) -> Result<(), &'static str> {
+        let (settled, claimed) = match self.outstanding.get(&target) {
+            Some(out) => (out.settled, out.claimed),
+            None => return Err("no such post"),
+        };
+        if let Some(claimed) = claimed {
+            self.banned_personas.insert(claimed);
+            // Rendering gate (§9): flag the pseudonym's posts on sight of the ban.
+            if let Some(name) = self.personas.get(&claimed).cloned() {
+                self.flag_author(&name);
+            }
+        }
+        if !settled {
+            self.outstanding.get_mut(&target).expect("just found").banned = true;
+            return Ok(());
+        }
+        let Some(claimed) = claimed else {
+            return Err("post already settled");
+        };
+        let newest = self
+            .outstanding
+            .iter()
+            .filter(|(_, o)| !o.settled && o.claimed == Some(claimed))
+            .max_by_key(|(eh, o)| (o.settle_barrier, **eh))
+            .map(|(eh, _)| *eh);
+        if let Some(eh) = newest {
+            self.outstanding.get_mut(&eh).expect("just found").banned = true;
+        }
+        Ok(())
     }
 
     /// Apply a rating to a target, deduplicated by `(target, claimed)`.
@@ -284,8 +350,8 @@ mod tests {
         assert_eq!(p.ballots.len(), 1);
         assert_eq!(
             p.ban_tally(),
-            (0, 1),
-            "the later ballot is the one that counts"
+            (1, 0),
+            "the first ballot is the one that counts"
         );
     }
 

@@ -7,18 +7,25 @@ import {
   pickScanSlot,
   scanEpochAt,
   scanEpochMs,
+  scansPerEpoch,
 } from '../../services/personasScanSchedule.std.ts';
 
 const HOUR = 3_600_000;
 const ANCHOR = 1_000_000;
 
 describe('personasScanSchedule', () => {
-  it('uses an hour unless told otherwise', () => {
-    assert.equal(scanEpochMs(undefined), HOUR);
-    assert.equal(scanEpochMs(''), HOUR);
-    assert.equal(scanEpochMs('nonsense'), HOUR);
-    assert.equal(scanEpochMs('0'), HOUR);
+  it('uses a day unless told otherwise', () => {
+    assert.equal(scanEpochMs(undefined), 24 * HOUR);
+    assert.equal(scanEpochMs(''), 24 * HOUR);
+    assert.equal(scanEpochMs('nonsense'), 24 * HOUR);
+    assert.equal(scanEpochMs('0'), 24 * HOUR);
     assert.equal(scanEpochMs('60000'), 60_000);
+  });
+
+  it('sends a fixed number of scans unless told otherwise', () => {
+    assert.equal(scansPerEpoch(undefined), 36);
+    assert.equal(scansPerEpoch('1.5'), 36);
+    assert.equal(scansPerEpoch('4'), 4);
   });
 
   it('numbers epochs from the anchor, so members agree on them', () => {

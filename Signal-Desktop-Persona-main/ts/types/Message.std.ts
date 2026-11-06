@@ -82,6 +82,7 @@ const messageAttributesEraseBehavior: Record<
   personaContextName: 'erase',
   personaAuthorship: 'erase',
   personaPoll: 'erase',
+  personaPollStatus: 'erase',
   personaBadgeNotice: 'erase',
   personaBadgeProof: 'erase',
   personaMyVote: 'erase',

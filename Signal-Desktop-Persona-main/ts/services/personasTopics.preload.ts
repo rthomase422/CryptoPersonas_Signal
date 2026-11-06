@@ -17,7 +17,7 @@
 // Signal chat test-server and the storage-service. So the number is drawn CLIENT-side
 // here and distributed over Signal itself:
 //
-//   1. the creator draws a cryptographically random context,
+//   1. the creator derives the context from the group and the name (contextForTopic),
 //   2. broadcasts a topic ANNOUNCEMENT to the group (`PZT2:` carriage, hidden from the
 //      timeline like the other protocol traffic),
 //   3. every member ingests it into this registry.
@@ -34,7 +34,7 @@
 // KNOWN LIMIT: a member who joins after a topic was announced will not have it, since
 // there is no backfill. Re-announcing on join, or a server registry, would fix it.
 
-import { randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 
 import type { ConversationModel } from '../models/conversations.preload.ts';
 import {
@@ -42,6 +42,7 @@ import {
   registerPersistedExtra,
 } from './personasPersistence.preload.ts';
 
+import { getPersonasEngine } from './personasEngine.preload.ts';
 import { createLogger } from '../logging/log.std.ts';
 import { toLogFormat } from '../types/errors.std.ts';
 import {
@@ -89,16 +90,37 @@ registerPersistedExtra('topics', {
   },
 });
 
-export function drawRandomContext(): number {
-  // Cryptographically random, not Math.random: the context should be unguessable, so
-  // that knowing a topic's NAME does not let an outsider derive its personas.
-  const bytes = randomBytes(CONTEXT_BYTES);
+// A topic's context is a hash of its name, so a name has exactly one context. If members
+// could pick the number, anyone could mint fresh contexts that display under an existing
+// topic's name, and get a fresh allowance of rate-limited personas in it each time.
+export function contextForTopic(groupId: string, rawName: string): number {
+  const bytes = createHash('sha256')
+    .update(`${groupId}\u0000${rawName.trim().toLowerCase()}`)
+    .digest()
+    .subarray(0, CONTEXT_BYTES);
   let value = 0;
   for (const byte of bytes) {
     value = value * 256 + byte;
   }
   // Never 0 — that is the "no topic" sentinel used by the unlimited plain pseudonym.
   return value === 0 ? 1 : value;
+}
+
+/**
+ * The topic name a post may display: the one it claims, if the post's proof really is in
+ * that topic's context. The name and the context are each bound to the post, but only
+ * this ties them to each other.
+ */
+export function verifiedContextName(
+  groupId: string | undefined,
+  eh: string,
+  contextName: string | undefined
+): string | undefined {
+  if (!groupId || !contextName) {
+    return undefined;
+  }
+  const context = getPersonasEngine(groupId)?.postContext(eh);
+  return context === contextForTopic(groupId, contextName) ? contextName : undefined;
 }
 
 /** Every topic this instance knows about in a group, for the composer's picker. */
@@ -128,24 +150,11 @@ export function resolveTopicContext(groupId: string, name: string): number | und
 /** Record a topic we learned about, from an announcement or from creating it. */
 function rememberTopic(groupId: string, announcement: PersonaTopicAnnouncement): void {
   const name = announcement.name.trim();
-  if (!name) {
+  if (!name || announcement.context !== contextForTopic(groupId, name)) {
     return;
   }
   const contextByTopic = topicsOf(groupId);
-  const existing = contextByTopic.get(name);
-  if (existing != null) {
-    if (existing !== announcement.context) {
-      // Two members created the same topic name concurrently. Deterministic tie-break
-      // so every replica converges on one context rather than splitting the topic:
-      // the numerically smaller context wins, everywhere, regardless of arrival order.
-      const winner = Math.min(existing, announcement.context);
-      log.warn(
-        `rememberTopic: conflicting contexts for "${name}" (${existing} vs ${announcement.context}); keeping ${winner}`
-      );
-      contextByTopic.set(name, winner);
-      personasExtrasChanged(groupId);
-      window.reduxActions?.composer?.personaTopicLearned(groupId, name, winner);
-    }
+  if (contextByTopic.has(name)) {
     return;
   }
   contextByTopic.set(name, announcement.context);
@@ -169,8 +178,8 @@ export function ingestTopicAnnouncement(
 }
 
 /**
- * Create a topic: draw a random context, remember it, and announce it to the group so
- * every member uses the same number. Returns the context, or undefined on failure.
+ * Create a topic: remember it and announce its name to the group, so every member can
+ * offer it. Returns the context, or undefined on failure.
  *
  * Idempotent by name — creating an existing topic returns the known context and
  * re-announces it, which doubles as a crude backfill for members who missed it.
@@ -185,7 +194,7 @@ export async function createTopic(
     return undefined;
   }
 
-  const context = topicsOf(groupId).get(name) ?? drawRandomContext();
+  const context = contextForTopic(groupId, name);
   rememberTopic(groupId, { name, context });
 
   try {

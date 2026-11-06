@@ -313,6 +313,8 @@ function getToast(toastType: ToastType): AnyToast {
       return { toastType: ToastType.PersonaBanned };
     case ToastType.PersonaViewsDiverged:
       return { toastType: ToastType.PersonaViewsDiverged };
+    case ToastType.PersonaRecordLost:
+      return { toastType: ToastType.PersonaRecordLost };
     case ToastType.PersonaBadgeRequested:
       return { toastType: ToastType.PersonaBadgeRequested };
     case ToastType.PersonaBadgeApproved:

@@ -106,7 +106,7 @@ fn rate2_params<F: PrimeField>() -> PoseidonConfig<F> {
 }
 
 /// Precompute `zeros[0..=HEIGHT]`, the hash of an empty subtree at each level.
-fn empty_subtree_hashes<F: PrimeField + Absorb>(height: usize) -> Vec<F> {
+pub(crate) fn empty_subtree_hashes<F: PrimeField + Absorb>(height: usize) -> Vec<F> {
     let mut zeros = Vec::with_capacity(height + 1);
     zeros.push(empty_leaf::<F>());
     for l in 0..height {

@@ -89,6 +89,7 @@ export enum ToastType {
   // — the ban record itself is anonymous and they may never see it.
   PersonaBanned = 'PersonaBanned',
   PersonaViewsDiverged = 'PersonaViewsDiverged',
+  PersonaRecordLost = 'PersonaRecordLost',
   PersonaBadgeRequested = 'PersonaBadgeRequested',
   PersonaBadgeApproved = 'PersonaBadgeApproved',
   // Personas demo: a badge request hidden from THIS admin's queue. Worded as "hidden",
@@ -264,6 +265,7 @@ export type AnyToast =
   | { toastType: ToastType.PersonaSelfRateBlocked }
   | { toastType: ToastType.PersonaBanned }
   | { toastType: ToastType.PersonaViewsDiverged }
+  | { toastType: ToastType.PersonaRecordLost }
   | { toastType: ToastType.PersonaBadgeRequested }
   | { toastType: ToastType.PersonaBadgeApproved }
   | { toastType: ToastType.PersonaBadgeDismissed }

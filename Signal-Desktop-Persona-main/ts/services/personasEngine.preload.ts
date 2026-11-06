@@ -26,7 +26,7 @@ import type {
 import { createLogger } from '../logging/log.std.ts';
 import { toLogFormat } from '../types/errors.std.ts';
 import { badgeSlotFromLogBody } from './personasBadgeRules.std.ts';
-import { stampOwnRecord } from './personasRegistry.std.ts';
+import { setOwnRecordSettler, stampOwnRecord } from './personasRegistry.std.ts';
 import {
   encodeRecordBody,
   encodeBadgeBody,
@@ -322,6 +322,7 @@ export function getPersonasEngine(
       const barrier = runtime.engine?.tick(nowMs);
       if (runtime.engine) {
         benchSettled(groupId, runtime.engine);
+        afterTick(groupId, runtime.engine);
       }
       return barrier;
     });
@@ -436,6 +437,29 @@ export function getPersonasViewReport(
 ): ViewReport | undefined {
   return getPersonasEngine(groupId)?.viewReport();
 }
+
+// What a barrier can reveal about our own records and the group's views.
+function afterTick(groupId: string, currentEngine: Engine): void {
+  const lost = currentEngine.takeLost();
+  if (lost.length > 0) {
+    // The member's object went back to where it was: keep that, then say so.
+    persistAfterEmit(groupId, currentEngine);
+    log.warn(`the group did not take ${lost.length} of our record(s); object restored`);
+    window.reduxActions?.toast?.showToast({
+      toastType: ToastType.PersonaRecordLost,
+    });
+  }
+  const foreign = currentEngine.foreignRoots() > 0;
+  if (foreign && !foreignRoots.get(groupId)) {
+    log.warn('a member named a root we never produced: views of the group differ');
+    window.reduxActions?.toast?.showToast({
+      toastType: ToastType.PersonaViewsDiverged,
+    });
+  }
+  foreignRoots.set(groupId, foreign);
+}
+
+const foreignRoots = new Map<string, boolean>();
 
 async function relayAndCheckViews(
   groupId: string,
@@ -588,14 +612,43 @@ export function ingestRecordForTimeline(
   }
 }
 
-// Fold our own record into our replica at the timestamp it will be SENT with, so every
-// replica — ours included — places it on the same barrier (personasRegistry).
+// Move a record of ours to the barrier every other member placed it on.
+setOwnRecordSettler(({ groupId, recordBase64 }, serverMs) => {
+  try {
+    getPersonasEngine(groupId)?.ingest(
+      Buffer.from(recordBase64, 'base64'),
+      ingestTimestampFor(groupId, serverMs)
+    );
+  } catch (error) {
+    log.error(`could not settle our own record: ${toLogFormat(error)}`);
+  }
+});
+
+// Whether a record is accepted because of who sent it. Those travel under a real account,
+// so their sender is answerable for the timestamp and has no echo to place itself by.
+const ATTRIBUTABLE_RECORDS = new Set([
+  'Join',
+  'RejoinApprove',
+  'Ban',
+  'BadgeApprove',
+]);
+export function isAttributableRecord(
+  groupId: string | undefined,
+  body: string | undefined | null
+): boolean {
+  const record = decodeRecordBody(body);
+  const kind = record && getPersonasEngine(groupId)?.recordKind(record);
+  return kind != null && ATTRIBUTABLE_RECORDS.has(kind);
+}
+
+// Fold our own record into our replica at the timestamp it will be SENT with, until the
+// service's copy says where it really belongs (personasRegistry).
 function selfIngest(
   groupId: string,
   currentEngine: Engine,
   emitted: Emitted
 ): void {
-  const sentAt = stampOwnRecord(Buffer.from(emitted.bytes).toString('base64'));
+  const sentAt = stampOwnRecord(groupId, Buffer.from(emitted.bytes).toString('base64'));
   currentEngine.ingest(emitted.bytes, ingestTimestampFor(groupId, sentAt));
 }
 
@@ -652,6 +705,12 @@ export type PersonaPostSend = {
 // it, and return what to send. The message displays `body` (plaintext) everywhere
 // while the wire carries the record — the send path swaps them via
 // `personaRecordBase64`. Returns undefined if the engine is unavailable.
+// Whether this member has used its posts until a sweep finishes. Its next post could not
+// be proved, so it has to be refused here.
+export function personaScanRequired(groupId: string | undefined): boolean {
+  return getPersonasEngine(groupId)?.scanRequired() ?? false;
+}
+
 export function composePersonaPost(
   groupId: string | undefined,
   text: string,
@@ -825,13 +884,14 @@ export function composePersonaVote(
 const scanStartedMs = new Map<string, number>();
 
 export function preparePersonaScan(
-  groupId: string | undefined
+  groupId: string | undefined,
+  dummy = false
 ): string | undefined {
   const currentEngine = getPersonasEngine(groupId);
   if (groupId) {
     scanStartedMs.set(groupId, benchNowMs());
   }
-  return currentEngine ? currentEngine.prepareScan() : undefined;
+  return currentEngine ? currentEngine.prepareScan(dummy) : undefined;
 }
 
 export function personaScanStillValid(groupId: string | undefined): boolean {
@@ -891,23 +951,22 @@ export function composeBadgeApprove(
   requestEh: string,
   slot: number
 ): { eh: string; body: string } | undefined {
-  return emitBadgeRecord(groupId, engine =>
+  const approval = emitBadgeRecord(groupId, engine =>
     engine.emitBadgeApprove(requestEh, slot)
   );
+  // Under the admin's own account, never the phantom: an approval counts only because
+  // of who sent it (recordRefusal), and it names a request, not the person behind it.
+  return approval && { eh: approval.eh, body: encodeRecordBody(approval.bytes) };
 }
 
 /**
- * Emit + self-ingest a badge record, carried under the PHANTOM badge marker.
- *
- * Mirrors `emitAndSelfIngest` exactly except for the encoder. Kept as its own helper so
- * the two badge records cannot drift apart: a request that hides its sender and an
- * approval that does not would be worse than either choice made consistently, because
- * the pair would narrow the anonymity set to "whoever the admin replied to".
+ * Emit + self-ingest a badge record. `body` is the phantom badge carriage, which is what
+ * a request travels under.
  */
 function emitBadgeRecord(
   groupId: string | undefined,
   produce: (engine: Engine) => Emitted
-): { eh: string; body: string } | undefined {
+): { eh: string; body: string; bytes: Uint8Array } | undefined {
   const currentEngine = getPersonasEngine(groupId);
   if (!groupId || !currentEngine) {
     return undefined;
@@ -923,7 +982,11 @@ function emitBadgeRecord(
     startMs,
     emitted.eh
   );
-  return { eh: emitted.eh, body: encodeBadgeBody(emitted.bytes) };
+  return {
+    eh: emitted.eh,
+    body: encodeBadgeBody(emitted.bytes),
+    bytes: emitted.bytes,
+  };
 }
 
 /**

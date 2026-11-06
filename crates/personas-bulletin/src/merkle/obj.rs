@@ -12,10 +12,9 @@
 //! # Set-committing, not append-order
 //!
 //! The store commits to the **set** of registered objects, not the order they
-//! arrived: leaves are the object commitments held in a `BTreeMap` (sorted by
-//! commitment) and the tree is rebuilt over that sorted order on every
-//! registration. So the root is a pure function of the set — any two replicas
-//! that have ingested the same registrations compute the identical root
+//! arrived: each commitment sits in the slot given by its own low bits, in a sparse
+//! tree ([`SparseMerkleTree`]). So the root is a pure function of the set — any two
+//! replicas that have ingested the same registrations compute the identical root
 //! *regardless of arrival order*. This mirrors the sorted-range nonmembership
 //! tree ([`super::callback`]) and is what lets the replica engine (d3) drop the
 //! per-record total ordering it would otherwise need to make an append-only tree
@@ -23,12 +22,14 @@
 //! nullifier wins — is not a tree property; it is the first-reveal-wins rule the
 //! nullifier set enforces, see [`Self::has_seen_nul`].)
 //!
-//! The cost of set-committing is that a registration reshuffles indices, so the
-//! rebuild is `O(n · HEIGHT)` rather than an append's `O(HEIGHT)`. That is fine
-//! at demo scale and is the natural home for the future Bloom-filter
-//! reconciliation (a proof advertises *which* recent records its tree includes,
-//! and a verifier reconstructs that exact set — only possible because the root is
-//! set-determined). See `docs/SERVERLESS_PROTOCOL.md` §5.
+//! An insert re-hashes one path, `O(HEIGHT)` however many objects there are.
+//!
+//! # Slot collisions
+//!
+//! Two objects can hash to the same slot, with probability about `n^2 / 2^(HEIGHT+1)`:
+//! around one in 10,000 for a thousand objects at the default height. The object placed
+//! first keeps the slot, and the later one is left out of the tree, the same on every
+//! replica. Its owner then has no membership and needs an admin-approved re-join.
 //!
 //! # Root: constant vs. public input
 //!
@@ -37,7 +38,7 @@
 //! `memb_data = None`, making the root a **public input** the verifier supplies
 //! per proof and pins against a root it computed itself.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use ark_crypto_primitives::sponge::Absorb;
 use ark_ff::PrimeField;
@@ -51,7 +52,8 @@ use zk_callbacks::generic::{
 };
 
 use super::gadget::{MerklePathVar, enforce_merkle_membership};
-use super::tree::{IncrementalMerkleTree, MerklePath};
+use super::sparse::SparseMerkleTree;
+use super::tree::MerklePath;
 
 /// The default height of the serverless object tree.
 ///
@@ -71,20 +73,19 @@ struct ObjEntry<F: PrimeField> {
 
 /// A set-committing Merkle object bulletin.
 ///
-/// The registered objects live in `entries`, keyed and ordered by commitment; the
-/// `tree` is rebuilt over that sorted order so its root commits to the *set*. The
-/// `nuls` list backs [`Self::has_seen_nul`] / [`UserBul::has_never_received_nul`],
+/// The registered objects live in `entries`, keyed by commitment; the `tree` holds each in
+/// its own slot, so its root commits to the *set*. The `nuls` set backs [`Self::has_seen_nul`] / [`UserBul::has_never_received_nul`],
 /// which is what actually blocks a rewind (a stale membership root is harmless on
 /// its own — see [`super::tree`]).
 #[derive(Clone, Debug)]
 pub struct MerkleObjStore<F: PrimeField + Absorb, const HEIGHT: usize = DEFAULT_OBJ_HEIGHT> {
-    /// Registered objects, keyed and sorted by commitment.
+    /// Registered objects, keyed by commitment.
     entries: BTreeMap<Com<F>, ObjEntry<F>>,
-    /// The Merkle tree over the sorted commitments; rebuilt when `entries` changes.
-    tree: IncrementalMerkleTree<F, HEIGHT>,
-    /// Every nullifier ever consumed, in registration order. A nullifier that
-    /// appears here has been spent; a second reveal is refused (first-reveal-wins).
-    nuls: Vec<Nul<F>>,
+    /// The commitments, each in its own slot.
+    tree: SparseMerkleTree<F, HEIGHT>,
+    /// Every nullifier ever consumed. A nullifier that appears here has been spent; a
+    /// second reveal is refused (first-reveal-wins).
+    nuls: HashSet<Nul<F>>,
 }
 
 impl<F: PrimeField + Absorb, const HEIGHT: usize> Default for MerkleObjStore<F, HEIGHT> {
@@ -98,8 +99,8 @@ impl<F: PrimeField + Absorb, const HEIGHT: usize> MerkleObjStore<F, HEIGHT> {
     pub fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
-            tree: IncrementalMerkleTree::new(),
-            nuls: Vec::new(),
+            tree: SparseMerkleTree::new(),
+            nuls: HashSet::new(),
         }
     }
 
@@ -130,13 +131,16 @@ impl<F: PrimeField + Absorb, const HEIGHT: usize> MerkleObjStore<F, HEIGHT> {
         self.nuls.contains(nul)
     }
 
+    /// Mark `nul` spent without registering a successor: a member giving up an object.
+    pub fn spend(&mut self, nul: Nul<F>) {
+        self.nuls.insert(nul);
+    }
+
     /// Register an object with its consumed nullifier and issued callback coms.
     ///
-    /// Inserts into the sorted set and rebuilds the tree, so the root re-commits to
-    /// the new set. Re-registering an existing commitment updates its data without
-    /// double-counting its nullifier (in practice commitments are unique). The
-    /// low-level primitive shared by [`UserBul::append_value`] and
-    /// [`JoinableBulletin::join_bul`].
+    /// Re-registering an existing commitment updates its data (in practice commitments are
+    /// unique); its nullifier counts as spent either way. The low-level primitive shared
+    /// by [`UserBul::append_value`] and [`JoinableBulletin::join_bul`].
     pub fn push(&mut self, object: Com<F>, old_nul: Nul<F>, cb_com_list: Vec<Com<F>>) {
         let is_new = self
             .entries
@@ -148,22 +152,18 @@ impl<F: PrimeField + Absorb, const HEIGHT: usize> MerkleObjStore<F, HEIGHT> {
                 },
             )
             .is_none();
+        self.nuls.insert(old_nul);
         if is_new {
-            self.nuls.push(old_nul);
+            let slot = Self::slot(object);
+            if self.tree.leaf(slot).is_none() {
+                self.tree.set(slot, object);
+            }
         }
-        self.rebuild();
     }
 
-    /// Rebuild the tree over the current sorted commitment set.
-    fn rebuild(&mut self) {
-        // Level by level: the same tree as appending each leaf, at ~2 hashes per leaf
-        // instead of HEIGHT (IncrementalMerkleTree::from_leaves).
-        self.tree = IncrementalMerkleTree::from_leaves(self.entries.keys().copied());
-    }
-
-    /// The sorted position of a registered commitment (its leaf index), or `None`.
-    fn position(&self, object: Com<F>) -> Option<usize> {
-        self.entries.keys().position(|c| *c == object)
+    /// The slot a commitment belongs in: its low `HEIGHT` bits.
+    fn slot(object: Com<F>) -> u64 {
+        object.into_bigint().as_ref()[0] & ((1u64 << HEIGHT) - 1)
     }
 }
 
@@ -196,9 +196,9 @@ impl<F: PrimeField + Absorb, U: UserData<F>, const HEIGHT: usize> PublicUserBul<
         &self,
         object: Com<F>,
     ) -> Option<(Self::MembershipPub, Self::MembershipWitness)> {
-        let i = self.position(object)?;
-        let path = self.tree.path(i)?;
-        Some((self.tree.root(), path))
+        let slot = Self::slot(object);
+        // Left out of the tree if another object already held its slot.
+        (self.tree.leaf(slot) == Some(object)).then(|| (self.tree.root(), self.tree.path(slot)))
     }
 
     fn enforce_membership_of(
@@ -259,7 +259,7 @@ mod tests {
     use ark_bn254::Fr as F;
     use personas_core::circuits::MsgUser;
 
-    const H: usize = 8;
+    const H: usize = 32;
     type Store = MerkleObjStore<F, H>;
 
     // The store is generic over `U: UserData<F>` and never inspects it; `MsgUser`
@@ -457,15 +457,16 @@ mod tests {
         let mut rng = ark_std::test_rng();
         println!("objects  ms per insert");
         for n in [100usize, 300, 1_000, 3_000, 10_000, 30_000, 100_000] {
-            let mut leaves: Vec<Fr> = (0..n).map(|_| Fr::rand(&mut rng)).collect();
-            leaves.sort();
-            const SAMPLES: usize = 3;
+            let mut store = MerkleObjStore::<Fr, DEFAULT_OBJ_HEIGHT>::new();
+            for _ in 0..n {
+                store.push(Fr::rand(&mut rng), Fr::rand(&mut rng), Vec::new());
+            }
+            const SAMPLES: usize = 100;
             let started = std::time::Instant::now();
             for _ in 0..SAMPLES {
-                let tree: IncrementalMerkleTree<Fr, DEFAULT_OBJ_HEIGHT> =
-                    IncrementalMerkleTree::from_leaves(leaves.iter().copied());
-                std::hint::black_box(tree.root());
+                store.push(Fr::rand(&mut rng), Fr::rand(&mut rng), Vec::new());
             }
+            std::hint::black_box(store.root());
             let ms = started.elapsed().as_secs_f64() * 1e3 / SAMPLES as f64;
             println!("{n:>7}  {ms:>8.2}");
         }

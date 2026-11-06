@@ -122,6 +122,7 @@ import { storageServiceUploadJob } from '../services/storage.preload.ts';
 import { challengeHandler } from '../services/challengeHandler.preload.ts';
 import {
   takeOwnRecordSentAt,
+  type PreparedPersonaPost,
   trackPersonaPost,
 } from '../services/personasRegistry.std.ts';
 import { decodeRecordBody } from '../services/personasCarriage.std.ts';
@@ -4302,6 +4303,7 @@ export class ConversationModel {
       timestamp,
       extraReduxActions,
       hideFromTimeline = false,
+      preparePersonaPost,
     }: {
       dontClearDraft?: boolean;
       isForwarding?: boolean;
@@ -4316,6 +4318,10 @@ export class ConversationModel {
       // this the SENDER's own copy is still a normal outgoing message, so the group
       // chat fills with ciphertext (the scan loop alone posts one every 30s).
       hideFromTimeline?: boolean;
+      // Personas demo: show the message now, as sending, and queue it once this resolves
+      // with what it needs on the wire. A post may have to wait for the member's last
+      // action to settle. Undefined means it cannot go out, and the message is removed.
+      preparePersonaPost?: () => Promise<PreparedPersonaPost | undefined>;
     } = {}
   ): Promise<MessageAttributesType | undefined> {
     if (this.isGroupV1AndDisabled()) {
@@ -4474,7 +4480,7 @@ export class ConversationModel {
     // ban that later revokes the persona we posted under flags our copy of the post
     // as well. Anything else would let the author be the one member who cannot see
     // that they were revoked.
-    if (personaEh != null && personaRecordBase64 != null) {
+    if (personaEh != null && (personaRecordBase64 != null || personaPoll != null)) {
       trackPersonaPost(personaEh, model.id);
     }
 
@@ -4490,23 +4496,27 @@ export class ConversationModel {
       reason: 'mandatoryProfileSharing',
     });
 
-    await conversationJobQueue.add(
-      {
-        type: conversationQueueJobEnum.enum.NormalMessage,
-        conversationId: this.id,
-        messageId: model.id,
-        revision: this.get('revision'),
-      },
-      async jobToInsert => {
-        log.info(
-          `enqueueMessageForSend: saving message ${model.id} and job ${jobToInsert.id}`
-        );
-        await window.MessageCache.saveMessage(model, {
-          jobToInsert,
-          forceSave: true,
-        });
-      }
-    );
+    const enqueue = () =>
+      conversationJobQueue.add(
+        {
+          type: conversationQueueJobEnum.enum.NormalMessage,
+          conversationId: this.id,
+          messageId: model.id,
+          revision: this.get('revision'),
+        },
+        async jobToInsert => {
+          log.info(
+            `enqueueMessageForSend: saving message ${model.id} and job ${jobToInsert.id}`
+          );
+          await window.MessageCache.saveMessage(model, {
+            jobToInsert,
+            forceSave: true,
+          });
+        }
+      );
+    if (!preparePersonaPost) {
+      await enqueue();
+    }
 
     const dbDuration = Date.now() - dbStart;
     if (dbDuration > SEND_REPORTING_THRESHOLD_MS) {
@@ -4556,7 +4566,39 @@ export class ConversationModel {
 
     await DataWriter.updateConversation(this.attributes);
 
+    if (preparePersonaPost) {
+      drop(this.#finishPersonaPost(model, preparePersonaPost, enqueue));
+    }
+
     return attributes;
+  }
+
+  // Nothing is saved or queued until the post is proved, so a failure, or quitting during
+  // the wait, leaves nothing behind that could go out later without its record.
+  async #finishPersonaPost(
+    model: MessageModel,
+    prepare: () => Promise<PreparedPersonaPost | undefined>,
+    enqueue: () => Promise<unknown>
+  ): Promise<void> {
+    let prepared: PreparedPersonaPost | undefined;
+    try {
+      prepared = await prepare();
+    } catch (error) {
+      log.error(`#finishPersonaPost: ${Errors.toLogFormat(error)}`);
+    }
+    if (!prepared) {
+      window.reduxActions.conversations.messageDeleted(model.id, this.id);
+      window.MessageCache.unregister(model.id);
+      return;
+    }
+    // Sent under the timestamp the record was placed by, so the service's copy can find it.
+    const sentAt =
+      takeOwnRecordSentAt(prepared.personaRecordBase64) ?? model.get('sent_at');
+    model.set({ ...prepared, sent_at: sentAt, timestamp: sentAt });
+    if (prepared.personaEh != null) {
+      trackPersonaPost(prepared.personaEh, model.id);
+    }
+    await enqueue();
   }
 
   async maybeClearUsername(): Promise<void> {

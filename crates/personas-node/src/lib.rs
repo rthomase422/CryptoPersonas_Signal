@@ -52,7 +52,7 @@ pub struct EngineOptions {
     /// OS entropy.
     pub seed: Option<f64>,
     /// Replica accept-rule config; each defaults to the demo values
-    /// (`root_window: 256`, `settlement_barriers: 3`, `poll_close_barriers: 1`).
+    /// (`root_window: 256`, a 48-hour ban window, 24-hour polls).
     pub root_window: Option<u32>,
     pub settlement_barriers: Option<u32>,
     pub poll_close_barriers: Option<u32>,
@@ -316,7 +316,9 @@ impl Journal {
             return Ok(());
         }
         let mut entry = Vec::with_capacity(44 + bytes.len());
-        if Eh::of_bytes(bytes) == eh {
+        let own_identity = personas_bulletin::replica::record::decode(bytes)
+            .is_ok_and(|(_, computed)| computed == eh);
+        if own_identity {
             entry.extend_from_slice(&barrier.to_le_bytes());
             entry.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         } else {
@@ -388,10 +390,22 @@ impl Engine {
             None
         };
 
+        // The windows are durations, so they follow the group's barrier period.
+        let deployed = ReplicaConfig::for_period_ms(
+            options
+                .heartbeat_period_ms
+                .map_or(personas_bulletin::replica::DEFAULT_BARRIER_PERIOD_MS, |p| p as u64),
+        );
         let config = ReplicaConfig {
-            root_window: options.root_window.unwrap_or(256) as usize,
-            settlement_barriers: options.settlement_barriers.unwrap_or(3) as u64,
-            poll_close_barriers: options.poll_close_barriers.unwrap_or(1) as u64,
+            root_window: options
+                .root_window
+                .map_or(deployed.root_window, |n| n as usize),
+            settlement_barriers: options
+                .settlement_barriers
+                .map_or(deployed.settlement_barriers, u64::from),
+            poll_close_barriers: options
+                .poll_close_barriers
+                .map_or(deployed.poll_close_barriers, u64::from),
         };
 
         let transport: Arc<dyn Transport> = Arc::new(MockTransport::new());
@@ -506,6 +520,50 @@ impl Engine {
 
     /// Scans left to finish the sweep in progress (0 when not scanning). A sweep visits
     /// every callback, one per scan; `outstanding_callbacks` only drops when it ends.
+    /// Whether this member has used its interactions: its next post must wait for a
+    /// finished sweep.
+    #[napi]
+    pub fn scan_required(&self) -> bool {
+        self.inner.scan_required()
+    }
+
+    /// Whether this member could prove now: its object is in a settled root.
+    #[napi]
+    pub fn is_settled(&self) -> bool {
+        self.inner.is_settled()
+    }
+
+    /// Whether this member could vote or rate now, which needs less than `is_settled`.
+    #[napi]
+    pub fn can_prove_identity(&self) -> bool {
+        self.inner.can_prove_identity()
+    }
+
+    /// Records of ours the group lost since the last call, as hex envelope hashes. The
+    /// member's object is already back where it was.
+    #[napi]
+    pub fn take_lost(&mut self) -> Vec<String> {
+        self.inner.take_lost().iter().map(ToString::to_string).collect()
+    }
+
+    /// The context a post was made in, by hex envelope hash. `None` for an unknown or
+    /// anonymous post, or a context too large to be a topic's.
+    #[napi]
+    pub fn post_context(&self, eh: String) -> Option<f64> {
+        let bytes: [u8; 32] = hex::decode(eh).ok()?.try_into().ok()?;
+        let context = self
+            .inner
+            .replica()
+            .post_context(&personas_bulletin::replica::record::Eh(bytes))?;
+        (context < (1 << 53)).then_some(context as f64)
+    }
+
+    /// How many records from others name a root this replica never produced.
+    #[napi]
+    pub fn foreign_roots(&self) -> u32 {
+        self.inner.foreign_roots() as u32
+    }
+
     #[napi]
     pub fn sweep_remaining(&self) -> u32 {
         self.inner.sweep_remaining() as u32
@@ -522,9 +580,9 @@ impl Engine {
     /// [`scan_still_valid`](Self::scan_still_valid), then [`commit_scan`] (which returns
     /// the record to send) or [`discard_scan`]. Every other emit is refused meanwhile.
     #[napi]
-    pub fn prepare_scan(&mut self) -> napi::Result<String> {
+    pub fn prepare_scan(&mut self, dummy: bool) -> napi::Result<String> {
         self.inner
-            .prepare_scan(&mut self.rng)
+            .prepare_scan(&mut self.rng, dummy)
             .map(|eh| eh_to_hex(&eh))
             .map_err(|e| napi::Error::from_reason(format!("scan failed: {e}")))
     }
@@ -861,9 +919,15 @@ impl Engine {
     /// As a group admin, allow `account` (32 hex chars: the ACI without dashes) one more
     /// join. Send it under the admin's OWN account: members only ingest it from an admin.
     #[napi]
-    pub fn emit_rejoin_approve(&mut self, account: String) -> napi::Result<JsEmitted> {
+    pub fn emit_rejoin_approve(
+        &mut self,
+        account: String,
+        proof: Option<Buffer>,
+    ) -> napi::Result<JsEmitted> {
         let account = account_from_hex(&account)?;
-        let r = self.inner.emit_rejoin_approve(account);
+        let r = self
+            .inner
+            .emit_rejoin_approve(account, proof.as_ref().map(|p| p.as_ref()));
         self.emit(r)
     }
 
@@ -895,7 +959,7 @@ impl Engine {
     /// it is a statement about a tree the requester built.
     #[napi]
     pub fn verify_not_banned(&self, proof: Buffer) -> Option<String> {
-        let (account, root) =
+        let (account, _nul, root) =
             personas_core::verify_not_banned_proof(&self.not_banned_vk, proof.as_ref())?;
         if !self.inner.replica().has_produced_root(root) {
             return None;
@@ -903,8 +967,8 @@ impl Engine {
         Some(hex::encode(personas_core::account_bytes(&account)))
     }
 
-    /// Start over as a brand-new member (fresh object, new secret key) — after an admin
-    /// approved this account's re-join. Badges, reputation and pseudonyms are abandoned.
+    /// Start over with a fresh object under the same secret key — after an admin approved
+    /// this account's re-join. Badges and reputation are abandoned; pseudonyms stay.
     #[napi]
     pub fn reset_member(&mut self) -> napi::Result<()> {
         self.inner
@@ -931,13 +995,20 @@ impl Engine {
         let (rec, _) = personas_bulletin::replica::record::decode(record.as_ref()).ok()?;
         let (kind, account) = match rec {
             personas_bulletin::replica::record::Record::Join { account, .. } => ("join", account.0),
-            personas_bulletin::replica::record::Record::RejoinApprove { account } => {
+            personas_bulletin::replica::record::Record::RejoinApprove { account, .. } => {
                 ("rejoin-approve", account.0)
             }
-            // A ban names no account, but like an approval it must come from an admin.
+            // These name no account, but like a re-join approval they must come from an
+            // admin.
             personas_bulletin::replica::record::Record::Ban { .. } => {
                 return Some(JsAccountClaim {
                     kind: "ban".to_string(),
+                    account: String::new(),
+                });
+            }
+            personas_bulletin::replica::record::Record::BadgeApprove { .. } => {
+                return Some(JsAccountClaim {
+                    kind: "badge-approve".to_string(),
                     account: String::new(),
                 });
             }

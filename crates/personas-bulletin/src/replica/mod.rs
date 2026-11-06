@@ -81,7 +81,7 @@ use std::path::PathBuf;
 use ark_ff::PrimeField;
 use ark_ff::ToConstraintField;
 use ark_snark::SNARK;
-use personas_core::PreparedVk;
+use personas_core::{H, PreparedVk};
 use zk_callbacks::crypto::enc::AECipherSigZK;
 use zk_callbacks::generic::bulletin::CallbackBul;
 use zk_callbacks::generic::object::Time;
@@ -124,6 +124,8 @@ pub struct ReplicaKeys {
     pub badge_request: VK,
     /// A join's freshness proof (`join_pred`).
     pub join: VK,
+    /// A re-join's proof about the object given up (`not_banned_pred`).
+    pub not_banned: VK,
 }
 
 /// [`ReplicaKeys`], each prepared once for verification ([`PreparedVk`]).
@@ -135,6 +137,7 @@ pub(crate) struct PreparedKeys {
     pseudonym_pred: PreparedVk,
     badge_request: PreparedVk,
     join: PreparedVk,
+    not_banned: PreparedVk,
 }
 
 impl PreparedKeys {
@@ -147,6 +150,7 @@ impl PreparedKeys {
             pseudonym_pred: PreparedVk::new(&keys.pseudonym_pred),
             badge_request: PreparedVk::new(&keys.badge_request),
             join: PreparedVk::new(&keys.join),
+            not_banned: PreparedVk::new(&keys.not_banned),
         }
     }
 }
@@ -163,6 +167,7 @@ impl ReplicaKeys {
             pseudonym_pred: keys.pseudonym_pred_verifying_key.clone(),
             badge_request: keys.badge_request_verifying_key.clone(),
             join: keys.join_pred_verifying_key.clone(),
+            not_banned: keys.not_banned_pred_verifying_key.clone(),
         }
     }
 }
@@ -179,13 +184,38 @@ pub struct Config {
     pub poll_close_barriers: u64,
 }
 
-impl Default for Config {
-    fn default() -> Self {
+/// How long a post's ticket stays open to a ban.
+pub const BAN_WINDOW_MS: u64 = 48 * 60 * 60 * 1000;
+/// How long a poll takes ballots.
+pub const POLL_OPEN_MS: u64 = 24 * 60 * 60 * 1000;
+/// The barrier period a group gets unless its bundle says otherwise.
+pub const DEFAULT_BARRIER_PERIOD_MS: u64 = 10_000;
+
+impl Config {
+    /// The deployed windows, in barriers of `period_ms`. Every member derives these from
+    /// the period in the group's bundle, so they cannot disagree.
+    pub fn for_period_ms(period_ms: u64) -> Self {
+        let period = period_ms.max(1);
+        Self {
+            root_window: 256,
+            settlement_barriers: BAN_WINDOW_MS.div_ceil(period),
+            poll_close_barriers: POLL_OPEN_MS.div_ceil(period),
+        }
+    }
+
+    /// Windows of a few barriers, for tests and benchmarks that cross them on purpose.
+    pub fn fast() -> Self {
         Self {
             root_window: 256,
             settlement_barriers: 3,
             poll_close_barriers: 2,
         }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::for_period_ms(DEFAULT_BARRIER_PERIOD_MS)
     }
 }
 
@@ -252,6 +282,9 @@ pub struct Replica<
     /// TEST BUILDS ONLY: accept a join without checking its freshness proof, for the
     /// proof-free ordering tests that build joins without keys. Always false otherwise.
     trust_unproven_joins: bool,
+    /// TEST BUILDS ONLY: store records carrying placeholder proofs, so a test can exercise
+    /// buffering without generating keys.
+    admit_unproven_for_tests: bool,
 
     /// Append-only journal of accepted record bytes; replayed on [`Replica::open`].
     journal: Option<PathBuf>,
@@ -285,6 +318,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
             state_at: 0,
             checkpoints: std::collections::BTreeMap::new(),
             trust_unproven_joins: false,
+            admit_unproven_for_tests: false,
             journal: None,
             last_settle: None,
         };
@@ -370,8 +404,8 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
     }
 
     /// Every seen record for a LATE JOINER, as `(first_barrier, eh, bytes)` with the
-    /// private text removed ([`record::strip_private_text`]). The `eh` is the record's
-    /// real one: the stripped bytes no longer hash to it.
+    /// private text removed ([`record::strip_private_text`]). A record's identity does
+    /// not cover the text, so a stripped record keeps its `eh`.
     pub fn catch_up_records(&self) -> Vec<(u64, Eh, Vec<u8>)> {
         self.seen
             .iter()
@@ -382,11 +416,10 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
             .collect()
     }
 
-    /// Add many records at once, each under the `eh` given rather than one computed
-    /// from its bytes (so a stripped record keeps its identity), with ONE rebuild —
-    /// ingesting a whole history one record at a time would replay it once per
-    /// record. Already-seen records are skipped, malformed ones ignored. Returns how
-    /// many were new.
+    /// Add many records at once with ONE rebuild: ingesting a whole history one record at
+    /// a time would replay it once per record. Already-seen records are skipped; ones
+    /// that are malformed, do not hash to the `eh` given or fail their proof are ignored.
+    /// Returns how many were new.
     pub fn import_records(&mut self, items: Vec<(u64, Eh, Vec<u8>)>) -> usize {
         let built = self.current_barrier;
         let mut from: Option<u64> = None;
@@ -395,9 +428,16 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
             if self.seen.contains_key(&eh) {
                 continue;
             }
-            let Ok((record, _, view)) = record::decode_with_view(&bytes) else {
+            let Ok((record, identity, view)) = record::decode_with_view(&bytes) else {
                 continue;
             };
+            // A record is what it hashes to and what its proof shows, whoever supplied
+            // it. A poll's identity covers the text this copy leaves out, so a poll is the
+            // exception, and a copy can still leave records out: those rest on the sender.
+            let is_poll = matches!(record, Record::PollOpen { .. });
+            if (!is_poll && identity != eh) || self.admissible_without_text(&record, eh).is_err() {
+                continue;
+            }
             self.seen.insert(
                 eh,
                 Seen {
@@ -514,6 +554,10 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                 .get(&eh)
                 .cloned()
                 .unwrap_or(Status::Buffered));
+        }
+        // Records replayed from the journal were admitted when they first arrived.
+        if journal && let Err(reason) = self.admissible(&rec, eh) {
+            return Ok(Status::Rejected(reason));
         }
         if journal && let Some(path) = &self.journal {
             append_journal(path, &bytes);
@@ -702,6 +746,13 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
 
     /// TEST BUILDS ONLY — see the field.
     #[cfg(test)]
+    pub(crate) fn admit_unproven_for_tests(mut self) -> Self {
+        self.admit_unproven_for_tests = true;
+        self
+    }
+
+    /// TEST BUILDS ONLY — see the field.
+    #[cfg(test)]
     pub(crate) fn trust_unproven_joins_for_tests(mut self) -> Self {
         self.trust_unproven_joins = true;
         self.rebuild();
@@ -737,6 +788,74 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
         &self.state.obj
     }
 
+    /// The object tree a member proves against: the end of the newest barrier that closed
+    /// at least a full barrier ago ([`SETTLE_LAG`]). `None` until the group is that old.
+    ///
+    /// Every member who received the group's records holds this same tree, so a proof
+    /// names a root that says nothing about what its prover has seen lately, and by the
+    /// time a root is used the records stamped into its barrier have been delivered.
+    pub fn proving_store(&self) -> Option<&MerkleObjStore<F, OH>> {
+        self.proving_store_at(SETTLE_LAG)
+    }
+
+    /// [`proving_store`](Self::proving_store), `lag` barriers back. A messenger with a clock
+    /// can use a lag of 1 once enough of the current barrier has passed.
+    pub fn proving_store_at(&self, lag: u64) -> Option<&MerkleObjStore<F, OH>> {
+        let barrier = self.current_barrier.checked_sub(lag)?;
+        self.checkpoints
+            .range(..=barrier)
+            .next_back()
+            .map(|(_, st)| &st.obj)
+    }
+
+    /// Whether a record is lost for good: it was refused, or it still waits on a root the
+    /// group has not produced even though that root's barrier has settled. Its sender can
+    /// take back the object it spent, because no replica will ever apply it.
+    pub fn is_lost(&self, eh: &Eh) -> bool {
+        let Some(seen) = self.seen.get(eh) else {
+            return true;
+        };
+        match self.state.statuses.get(eh) {
+            Some(Status::Applied) => false,
+            Some(Status::Rejected(reason)) => *reason != NULLIFIER_SPENT,
+            _ => seen.first_barrier + SETTLE_LAG < self.current_barrier,
+        }
+    }
+
+    /// The context a pseudonymous post was made in; `None` for anything else, or for a
+    /// context too large for a `u64`, which no topic has. Bound by the post's proof, which
+    /// is what lets a client check the topic name the post displays.
+    pub fn post_context(&self, eh: &Eh) -> Option<u64> {
+        let Record::Post { flavour, extra, .. } = &self.seen.get(eh)?.record else {
+            return None;
+        };
+        if *flavour == Flavour::Anon {
+            return None;
+        }
+        let key = f_key(*extra.0.first()?);
+        let (low, high) = key.split_at(8);
+        high.iter()
+            .all(|b| *b == 0)
+            .then(|| u64::from_le_bytes(low.try_into().expect("eight bytes")))
+    }
+
+    /// How many records from other members name a root this replica never produced,
+    /// though its barrier has settled. Honest members all produce the same roots, so any
+    /// such record means someone was shown a different set of records (§5.5).
+    pub fn foreign_roots(&self) -> usize {
+        self.seen
+            .iter()
+            .filter(|(eh, s)| {
+                s.first_barrier + SETTLE_LAG < self.current_barrier
+                    && matches!(self.state.statuses.get(*eh), Some(Status::Buffered))
+                    && !is_applicable(&s.record, &self.state.produced, &self.state.derived)
+                    && record_root_of(&s.record).is_some_and(|root| {
+                        !self.state.produced.contains(&f_key(root))
+                    })
+            })
+            .count()
+    }
+
     /// Read-only view of the callback store, for a co-located member to build a
     /// scan against the replica's **current-barrier** called set (§5.2). A scan is
     /// only ever valid against the latest barrier, so a member must read the live
@@ -770,24 +889,30 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
     /// callback set, as applying it would be.
     pub fn verify_record_proof(&self, bytes: &[u8]) -> Option<bool> {
         let (rec, eh) = record::decode(bytes).ok()?;
+        self.record_proof_holds(&rec, eh)
+    }
+
+    fn record_proof_holds(&self, rec: &Record, eh: Eh) -> Option<bool> {
         let mut cache = HashMap::new();
-        let ok = match &rec {
+        let ok = match rec {
             Record::Join {
                 object,
                 account,
+                pk,
                 proof,
                 ..
             } => memo_statement(
                 &mut cache,
                 eh,
                 &self.prepared.join,
-                &[object.0, account.0],
+                &[object.0, account.0, pk.0],
                 &proof.0,
             ),
             Record::Post {
                 flavour,
                 exec,
                 extra,
+                payload,
                 obj_root,
                 ..
             } => {
@@ -799,7 +924,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                         &self.prepared.standard,
                         exec.new_object,
                         exec.old_nullifier,
-                        F::from(0),
+                        payload.0,
                         exec.cb_com_list,
                         &exec.proof,
                         obj_root.0,
@@ -813,6 +938,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                         PseudonymArgs {
                             context: *extra.0.first()?,
                             claimed: *extra.0.get(1)?,
+                            payload: payload.0,
                         },
                         exec.cb_com_list,
                         &exec.proof,
@@ -828,6 +954,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                             context: *extra.0.first()?,
                             claimed: *extra.0.get(1)?,
                             i: *extra.0.get(2)?,
+                            payload: payload.0,
                         },
                         exec.cb_com_list,
                         &exec.proof,
@@ -876,33 +1003,45 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
             }
             Record::Rate {
                 target,
+                delta,
                 proof,
                 claimed,
                 obj_root,
-                ..
             } => memo_predicate(
                 &mut cache,
                 eh,
                 &self.prepared.pseudonym_pred,
                 target.context(),
                 claimed.0,
+                record::rating_payload(*target, *delta),
                 obj_root.0,
                 &proof.0,
             ),
             Record::Vote {
                 poll,
+                option,
                 proof,
                 claimed,
                 obj_root,
-                ..
             } => memo_predicate(
                 &mut cache,
                 eh,
                 &self.prepared.pseudonym_pred,
                 poll.context(),
                 claimed.0,
+                record::ballot_payload(*poll, *option),
                 obj_root.0,
                 &proof.0,
+            ),
+            Record::RejoinApprove {
+                account,
+                spent: Some(spent),
+            } => memo_statement(
+                &mut cache,
+                eh,
+                &self.prepared.not_banned,
+                &[account.0, spent.nul.0, spent.root.0],
+                &spent.proof.0,
             ),
             Record::PollOpen { .. }
             | Record::BadgeApprove { .. }
@@ -910,6 +1049,65 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
             | Record::Ban { .. } => return None,
         };
         Some(ok)
+    }
+
+    /// Whether a NEWLY arrived record may be stored at all.
+    ///
+    /// An identity leaves out proof bytes and other relayed fields, so a tampered copy has
+    /// the same identity as the real record. It must be refused here, unstored, or its
+    /// arrival first would make the real record look like a duplicate of it.
+    fn admissible(&mut self, rec: &Record, eh: Eh) -> Result<(), &'static str> {
+        if let Record::Post { body, payload, .. } = rec
+            && !self.admit_unproven_for_tests
+            && payload.0 != record::post_payload(body)
+        {
+            return Err("post text does not match its proof");
+        }
+        self.admissible_without_text(rec, eh)
+    }
+
+    /// [`admissible`](Self::admissible) for a late joiner's copy, whose posts arrive with
+    /// their text removed: everything the proof covers but the text itself.
+    fn admissible_without_text(&mut self, rec: &Record, eh: Eh) -> Result<(), &'static str> {
+        if self.admit_unproven_for_tests {
+            return Ok(());
+        }
+        match rec {
+            // Checked against the callback set it names, when it is applied. Its identity
+            // includes its proof, so a bad copy cannot block a good one.
+            Record::Scan { .. } => return Ok(()),
+            Record::Join { .. } if self.trust_unproven_joins => return Ok(()),
+            Record::Post {
+                flavour,
+                exec,
+                extra,
+                ..
+            } => {
+                let expected = match flavour {
+                    Flavour::Anon => 0,
+                    Flavour::Pseudo => 2,
+                    Flavour::PseudoRate => 3,
+                };
+                if extra.0.len() != expected {
+                    return Err("post has the wrong public arguments");
+                }
+                if !ticket_is_committed(&exec.0) {
+                    return Err("post ticket does not match its proof");
+                }
+            }
+            Record::BadgeRequest { exec, .. } if !ticket_is_committed(&exec.0) => {
+                return Err("badge request ticket does not match its proof");
+            }
+            _ => {}
+        }
+        match self.record_proof_holds(rec, eh) {
+            Some(false) => Err("proof failed"),
+            Some(true) => {
+                self.verify_cache.insert(eh, true);
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 
     pub fn status(&self, eh: &Eh) -> Option<Status> {
@@ -1005,6 +1203,15 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
         }
 
         for b in from..=self.current_barrier {
+            // Barrier `b - 1` has closed, so its root joins the roots a proof may name.
+            // This is the only place a root is produced: the root at the end of a barrier
+            // depends on the set of records in it and not on the order they arrived, so
+            // a record racing another in the same barrier cannot strand anything.
+            if b > 0 {
+                let window = self.config.root_window;
+                record_root(&mut st.produced, &mut st.produced_order, st.obj.root(), window);
+            }
+
             // (1) The barrier event fires *first* (§5.2): settle every ticket due or
             //     banned as of the records applied through the previous barrier, and
             //     re-pin the callback root. A scan that arrives at barrier `b` must
@@ -1023,7 +1230,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
             }
             self.run_pass(b, &mut st, &mut pending);
 
-            if b < self.current_barrier {
+            if b < self.current_barrier && b + CHECKPOINT_BARRIERS >= self.current_barrier {
                 self.checkpoints.insert(b, st.clone());
             }
         }
@@ -1071,8 +1278,6 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                 &mut st.obj,
                 &st.cbs,
                 &mut st.derived,
-                &mut st.produced,
-                &mut st.produced_order,
             );
             st.statuses.insert(eh, status);
         }
@@ -1182,10 +1387,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
         obj: &mut MerkleObjStore<F, OH>,
         cbs: &MerkleCallbackStore<F, MH, NH>,
         derived: &mut Derived,
-        produced: &mut HashSet<[u8; 32]>,
-        produced_order: &mut VecDeque<[u8; 32]>,
     ) -> Status {
-        let window = self.config.root_window;
         let w = self.config.settlement_barriers;
         // Borrow the record out of `seen` for the duration; `self.verify_cache` is a
         // disjoint field, so a free helper can memoise while we hold `&record`.
@@ -1193,9 +1395,10 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
         match &seen.record {
             Record::Join {
                 object,
-                old_nul,
                 account,
+                pk,
                 proof,
+                ..
             } => {
                 // FRESH OBJECTS ONLY. Without this a join appended any commitment at all,
                 // so a member could join with a badge, a reputation or a clean ban flag of
@@ -1205,7 +1408,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                         &mut self.verify_cache,
                         eh,
                         &self.prepared.join,
-                        &[object.0, account.0],
+                        &[object.0, account.0, pk.0],
                         &proof.0,
                     )
                 {
@@ -1221,9 +1424,23 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                 if used >= allowed {
                     return Status::Rejected("account already joined");
                 }
+                // ONE SECRET KEY PER ACCOUNT, and the same one for good. Two accounts on one
+                // key would share pseudonyms, so a ban on one object would leave the other
+                // posting as the same persona, and a re-join under a new key would give its
+                // owner a second vote in every poll.
+                let pk_key = f_key(pk.0);
+                if derived.pk_account.get(&pk_key).is_some_and(|a| *a != key) {
+                    return Status::Rejected("public key belongs to another account");
+                }
+                if derived.account_pk.get(&key).is_some_and(|p| *p != pk_key) {
+                    return Status::Rejected("account joined with another public key");
+                }
+                derived.pk_account.insert(pk_key, key);
+                derived.account_pk.insert(key, pk_key);
                 derived.joins.insert(key, used + 1);
-                obj.push(object.0, old_nul.0, Vec::new());
-                record_root(produced, produced_order, obj.root(), window);
+                // A join consumes no real nullifier. The record's `old_nul` is not proved, so
+                // honouring it would let a joiner mark someone else's nullifier spent.
+                obj.push(object.0, F::from(0), Vec::new());
                 derived.log.push(LogEntry {
                     eh,
                     kind: "Join",
@@ -1237,11 +1454,10 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
             Record::Ban { target } => {
                 // An admin's decision (checked by the client before ingest): the post's
                 // ticket falls due at once and is invoked with BAN_FLAG at the next
-                // barrier (`settle_barrier`), exactly as a passed ban poll would.
-                match derived.outstanding.get_mut(target) {
-                    Some(out) if out.settled => return Status::Rejected("post already settled"),
-                    Some(out) => out.banned = true,
-                    None => return Status::Rejected("no such post"),
+                // barrier (`settle_barrier`), exactly as a passed ban poll would. A
+                // settled pseudonymous post passes the ban on (`Derived::ban`).
+                if let Err(reason) = derived.ban(*target) {
+                    return Status::Rejected(reason);
                 }
                 derived.log.push(LogEntry {
                     eh,
@@ -1253,9 +1469,25 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                 Status::Applied
             }
 
-            Record::RejoinApprove { account } => {
+            Record::RejoinApprove { account, spent } => {
                 // Admin-ness is checked by the client before ingest (the record is sent
-                // under the admin's own account); here it only grants the allowance.
+                // under the admin's own account). Here it grants the allowance and retires
+                // the object given up, so it cannot stay in use beside the new one.
+                if let Some(spent) = spent {
+                    if !memo_statement(
+                        &mut self.verify_cache,
+                        eh,
+                        &self.prepared.not_banned,
+                        &[account.0, spent.nul.0, spent.root.0],
+                        &spent.proof.0,
+                    ) {
+                        return Status::Rejected("re-join proof failed");
+                    }
+                    if obj.has_seen_nul(&spent.nul.0) {
+                        return Status::Rejected("re-join names an object already moved on from");
+                    }
+                    obj.spend(spent.nul.0);
+                }
                 let key = f_key(account.0);
                 *derived.rejoin_allowance.entry(key).or_insert(0) += 1;
                 derived.log.push(LogEntry {
@@ -1273,10 +1505,14 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                 exec,
                 extra,
                 body,
+                payload,
                 obj_root,
             } => {
                 let exec = &exec.0;
                 let root = obj_root.0;
+                if !ticket_is_committed(exec) {
+                    return Status::Rejected("post ticket does not match its proof");
+                }
                 let ok = match flavour {
                     Flavour::Anon => memo_interaction::<OH, _, 1>(
                         &mut self.verify_cache,
@@ -1284,7 +1520,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                         &self.prepared.standard,
                         exec.new_object,
                         exec.old_nullifier,
-                        F::from(0),
+                        payload.0,
                         exec.cb_com_list,
                         &exec.proof,
                         root,
@@ -1293,6 +1529,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                         let a = PseudonymArgs {
                             context: extra.0[0],
                             claimed: extra.0[1],
+                            payload: payload.0,
                         };
                         memo_interaction::<OH, _, 1>(
                             &mut self.verify_cache,
@@ -1320,6 +1557,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                             context: extra.0[0],
                             claimed: extra.0[1],
                             i: extra.0[2],
+                            payload: payload.0,
                         };
                         memo_interaction::<OH, _, 1>(
                             &mut self.verify_cache,
@@ -1343,20 +1581,27 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                     // to a stale state) and its successor is refused — it can never
                     // be built upon. Only the object's owner can even produce this,
                     // so a collision is self-inflicted.
-                    return Status::Rejected("nullifier already spent");
+                    return Status::Rejected(NULLIFIER_SPENT);
                 }
                 obj.push(
                     exec.new_object,
                     exec.old_nullifier,
                     exec.cb_com_list.to_vec(),
                 );
-                record_root(produced, produced_order, obj.root(), window);
 
                 // File the callback ticket the poster committed to (§7).
                 let callback = exec.cb_tik_list[0].0.clone();
-                derived
-                    .outstanding
-                    .insert(eh, Outstanding::new(callback, Time::from(0), barrier + w));
+                let claimed = match flavour {
+                    Flavour::Anon => None,
+                    Flavour::Pseudo | Flavour::PseudoRate => Some(tally::f_key(extra.0[1])),
+                };
+                let mut ticket = Outstanding::new(callback, Time::from(0), barrier + w, claimed);
+                // A pseudonym a ban has reached: this post is flagged, and its ticket
+                // carries the ban to the member's object.
+                let flagged = claimed.is_some_and(|c| derived.banned_personas.contains(&c));
+                ticket.banned = flagged;
+                derived.outstanding.insert(eh, ticket);
+                derived.open_tickets.insert(eh);
 
                 // Render (minimally). A pseudonym gets a petname; an anon post none.
                 let author = match flavour {
@@ -1368,7 +1613,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                     kind: "Post",
                     author,
                     body: body.clone(),
-                    flagged: false,
+                    flagged,
                 });
                 Status::Applied
             }
@@ -1386,6 +1631,9 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                 }
                 let exec = &exec.0;
                 let root = obj_root.0;
+                if !ticket_is_committed(exec) {
+                    return Status::Rejected("badge request ticket does not match its proof");
+                }
                 // Same interaction shape as an anonymous post — one callback, no public
                 // arguments — verified against the badge-request key.
                 // PUBLIC ARGS MUST MATCH THE PROVER EXACTLY.
@@ -1419,20 +1667,20 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                     return Status::Rejected("badge request proof failed");
                 }
                 if obj.has_seen_nul(&exec.old_nullifier) {
-                    return Status::Rejected("nullifier already spent");
+                    return Status::Rejected(NULLIFIER_SPENT);
                 }
                 obj.push(
                     exec.new_object,
                     exec.old_nullifier,
                     exec.cb_com_list.to_vec(),
                 );
-                record_root(produced, produced_order, obj.root(), window);
 
                 // The ticket an approval will invoke.
                 let callback = exec.cb_tik_list[0].0.clone();
                 derived
                     .outstanding
-                    .insert(eh, Outstanding::new(callback, Time::from(0), barrier + w));
+                    .insert(eh, Outstanding::new(callback, Time::from(0), barrier + w, None));
+                derived.open_tickets.insert(eh);
 
                 derived.log.push(LogEntry {
                     eh,
@@ -1502,10 +1750,9 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                     return Status::Rejected("scan proof failed");
                 }
                 if obj.has_seen_nul(&exec.old_nullifier) {
-                    return Status::Rejected("nullifier already spent");
+                    return Status::Rejected(NULLIFIER_SPENT);
                 }
                 obj.push(exec.new_object, exec.old_nullifier, Vec::new());
-                record_root(produced, produced_order, obj.root(), window);
                 derived.log.push(LogEntry {
                     eh,
                     kind: "Scan",
@@ -1535,6 +1782,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                         closed: false,
                     },
                 );
+                derived.open_polls.insert(eh);
                 Status::Applied
             }
 
@@ -1552,6 +1800,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                     &self.prepared.pseudonym_pred,
                     context,
                     claimed.0,
+                    record::ballot_payload(*poll, *option),
                     obj_root.0,
                     &proof.0,
                 );
@@ -1559,11 +1808,11 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                     return Status::Rejected("vote proof failed");
                 }
                 // Applicability guaranteed the poll exists.
-                derived
-                    .polls
-                    .get_mut(poll)
-                    .expect("poll present by is_applicable")
-                    .cast(claimed.0, *option);
+                let open = derived.polls.get_mut(poll).expect("poll present by is_applicable");
+                if open.closed {
+                    return Status::Rejected("poll closed");
+                }
+                open.cast(claimed.0, *option);
                 Status::Applied
             }
 
@@ -1581,11 +1830,15 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
                     &self.prepared.pseudonym_pred,
                     context,
                     claimed.0,
+                    record::rating_payload(*target, *delta),
                     obj_root.0,
                     &proof.0,
                 );
                 if !ok {
                     return Status::Rejected("rating proof failed");
+                }
+                if delta.unsigned_abs() != 1 {
+                    return Status::Rejected("a rating is +1 or -1");
                 }
                 derived.rate(*target, claimed.0, *delta as i64);
                 Status::Applied
@@ -1598,6 +1851,14 @@ impl<const OH: usize, const MH: usize, const NH: usize> Replica<OH, MH, NH> {
 /// demo's 10 s heartbeat this is about ten minutes; a record bucketed further back than
 /// that triggers one full replay.
 const CHECKPOINT_BARRIERS: u64 = 64;
+
+/// How many barriers behind the current one a proof's root is: the barrier before the
+/// current one may still be receiving records stamped just before it closed, so the one
+/// before that is the newest a member can rely on. A member's own new object can be proved
+/// from once its barrier gets there, which is what paces its object-changing records.
+pub const SETTLE_LAG: u64 = 2;
+
+const NULLIFIER_SPENT: &str = "nullifier already spent";
 
 /// How many barriers back a sender's [view claim](Replica::view_claim) is taken, and
 /// how far behind a receiver a claim must be before it is checked. With a one-minute
@@ -1682,7 +1943,10 @@ fn is_applicable(record: &Record, produced: &HashSet<[u8; 32]>, derived: &Derive
     let holds = |root: F| produced.contains(&f_key(root));
     match record {
         // No object root: applicable the moment its barrier arrives.
-        Record::Join { .. } | Record::PollOpen { .. } | Record::RejoinApprove { .. } => true,
+        Record::Join { .. } | Record::PollOpen { .. } => true,
+        Record::RejoinApprove { spent, .. } => {
+            spent.as_ref().is_none_or(|spent| holds(spent.root.0))
+        }
         Record::Post { obj_root, .. } => holds(obj_root.0),
         Record::BadgeRequest { obj_root, .. } => holds(obj_root.0),
         // An approval pins no root: it carries no proof, only a reference to a ticket
@@ -1695,6 +1959,18 @@ fn is_applicable(record: &Record, produced: &HashSet<[u8; 32]>, derived: &Derive
         Record::Vote { poll, obj_root, .. } => {
             holds(obj_root.0) && derived.polls.contains_key(poll)
         }
+    }
+}
+
+/// The object root a record's proof names, if it has one.
+fn record_root_of(record: &Record) -> Option<F> {
+    match record {
+        Record::Post { obj_root, .. }
+        | Record::BadgeRequest { obj_root, .. }
+        | Record::Rate { obj_root, .. }
+        | Record::Scan { obj_root, .. }
+        | Record::Vote { obj_root, .. } => Some(obj_root.0),
+        _ => None,
     }
 }
 
@@ -1726,34 +2002,56 @@ fn settle_barrier<const MH: usize, const NH: usize>(
     derived: &mut Derived,
 ) -> SettleTimings {
     let mut timings = SettleTimings::default();
-    // (a) Close ban polls whose window has elapsed; a pass marks its target banned.
+    // (a) Close polls whose window has elapsed; a ban poll that passes bans its target.
     //     Ban strictly precedes reputation (§7 property 1), so this runs first.
     let mut banned_targets: Vec<Eh> = Vec::new();
-    for poll in derived.polls.values_mut() {
-        if poll.closed || poll.kind != PollKind::Ban {
+    let mut closing: Vec<Eh> = Vec::new();
+    for eh in &derived.open_polls {
+        let poll = derived.polls.get_mut(eh).expect("an open poll exists");
+        if barrier < poll.opened_barrier + config.poll_close_barriers {
             continue;
         }
-        if barrier >= poll.opened_barrier + config.poll_close_barriers {
-            poll.closed = true;
-            if poll.passes_ban()
-                && let Some(target) = poll.target
-            {
-                banned_targets.push(target);
-            }
+        poll.closed = true;
+        closing.push(*eh);
+        if poll.kind == PollKind::Ban
+            && poll.passes_ban()
+            && let Some(target) = poll.target
+        {
+            banned_targets.push(target);
         }
     }
+    for eh in closing {
+        derived.open_polls.remove(&eh);
+    }
+    // `polls` is a HashMap, and a ban on a settled post picks a ticket: fix the order.
+    banned_targets.sort();
     for target in banned_targets {
-        if let Some(out) = derived.outstanding.get_mut(&target) {
-            out.banned = true;
-        }
+        // A target that does not exist or is out of reach simply goes unbanned.
+        let _ = derived.ban(target);
     }
+
+    // A ticket waits for a ban poll that was opened in time, so a poll cannot run out the
+    // clock on its own target. Only such polls count: one opened during the wait could
+    // otherwise be followed by another, holding a ticket and its reputation forever.
+    let held: HashSet<Eh> = derived
+        .open_polls
+        .iter()
+        .filter_map(|eh| derived.polls.get(eh))
+        .filter(|p| p.kind == PollKind::Ban)
+        .filter_map(|p| {
+            let target = p.target?;
+            let out = derived.outstanding.get(&target)?;
+            (p.opened_barrier <= out.settle_barrier).then_some(target)
+        })
+        .collect();
 
     // (b) Settle every ticket now due (or banned), once. The OTP is additive and
     //     keyless (§6), so this call is a deterministic function of public data —
     //     every replica computes the identical called leaf.
     let mut due: Vec<Eh> = derived
-        .outstanding
+        .open_tickets
         .iter()
+        .map(|eh| (eh, derived.outstanding.get(eh).expect("an open ticket exists")))
         // A ban and a BADGE APPROVAL both fall due immediately; everything else waits
         // for its settlement window.
         //
@@ -1769,11 +2067,12 @@ fn settle_barrier<const MH: usize, const NH: usize>(
         // would fork the called-ticket tree, which is why it is worth stating.)
         //
         // Without this a badge took `settlement_barriers` × the barrier period to
-        // arrive — 30s at the demo's 10s barrier — during which the requester could
-        // scan repeatedly, correctly absorb nothing, and reasonably conclude approval
-        // had silently failed.
-        .filter(|(_, o)| {
-            !o.settled && (o.banned || o.badge_slot.is_some() || barrier >= o.settle_barrier)
+        // arrive, during which the requester could scan repeatedly, correctly absorb
+        // nothing, and reasonably conclude approval had silently failed.
+        .filter(|(eh, o)| {
+            o.banned
+                || o.badge_slot.is_some()
+                || (barrier >= o.settle_barrier && !held.contains(*eh))
         })
         .map(|(eh, _)| *eh)
         .collect();
@@ -1814,13 +2113,7 @@ fn settle_barrier<const MH: usize, const NH: usize>(
             if let Some(o) = derived.outstanding.get_mut(&eh) {
                 o.settled = true;
             }
-            // Rendering gate (§9): flag the banned author's posts on sight of the ban.
-            if out.banned
-                && let Some(entry) = derived.log.iter().find(|e| e.eh == eh)
-                && let Some(author) = entry.author.clone()
-            {
-                derived.flag_author(&author);
-            }
+            derived.open_tickets.remove(&eh);
         }
     }
 
@@ -1856,6 +2149,14 @@ fn invoke<const MH: usize, const NH: usize>(
         out.filed_at,
     )
     .is_ok()
+}
+
+/// Whether the ticket a record publishes is the one its proof committed to.
+///
+/// The proof covers only the commitment, and the replica invokes the published ticket. A
+/// client that published any other ticket would have posts no ban could ever reach.
+fn ticket_is_committed(exec: &record::PostExec) -> bool {
+    exec.cb_tik_list[0].0.commit::<H>() == exec.cb_com_list[0]
 }
 
 /// Verify an interaction proof against `obj_root`, memoised by `eh`.
@@ -1905,7 +2206,7 @@ where
 }
 
 /// Verify a `pseudonym_pred` statement proof (a vote or a rating), memoised by
-/// `eh`. The public inputs are `[context, claimed, obj_root]` — `pub_args` first,
+/// `eh`. The public inputs are `[context, claimed, payload, obj_root]` — `pub_args` first,
 /// then the membership root, matching the statement circuit's allocation order —
 /// and every one of them is supplied by the *replica* (`context` derived from the
 /// referenced record, `obj_root` pinned to a produced root), so a forged context
@@ -1932,13 +2233,14 @@ fn memo_predicate(
     vk: &PreparedVk,
     context: F,
     claimed: F,
+    payload: F,
     obj_root: F,
     proof: &<Snark as SNARK<F>>::Proof,
 ) -> bool {
     if let Some(&v) = cache.get(&eh) {
         return v;
     }
-    let inputs = vec![context, claimed, obj_root];
+    let inputs = vec![context, claimed, payload, obj_root];
     let v = vk.verify(&inputs, proof);
     cache.insert(eh, v);
     v

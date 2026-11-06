@@ -20,10 +20,14 @@
 //      barrier are ordered by hash, not arrival, so the join must land in a later one),
 //      the member resets to a fresh object and joins again. The approval is used up.
 //
+// A reset keeps the member's secret key, so its pseudonyms stay its own and it cannot vote
+// or rate twice. Approving spends the old object, so it cannot stay in use beside the new
+// one. A member who has lost its key cannot rejoin the group, because every replica ties
+// an account to the key it first joined with.
+//
 // What it cannot do: a ban decided AFTER the reset on one of the old object's posts
-// lands on the abandoned object. A reset is a new identity, and past posts cannot follow
-// it. The proof narrows that to bans not yet settled at request time; the admin's
-// judgement covers the rest.
+// lands on the abandoned object. The proof narrows that to bans not yet settled at request
+// time; the admin's judgement covers the rest.
 
 import type { ConversationModel } from '../models/conversations.preload.ts';
 
@@ -44,7 +48,6 @@ import {
   ensurePersonaJoined,
   ourPersonasAccount,
 } from './personasMembership.preload.ts';
-import { clearPseudonyms } from './personasPseudonyms.preload.ts';
 import {
   personasExtrasChanged,
   registerPersistedExtra,
@@ -189,7 +192,6 @@ async function completePersonasResetIfApproved(groupId: string): Promise<void> {
   }
 
   engine.resetMember();
-  clearPseudonyms(groupId);
   forgetPersonaJoin(groupId);
   ownRequests.delete(groupId);
   // Save the fresh object before anything is sent (the ordering rule).
@@ -335,7 +337,15 @@ export function listResetRequests(
   });
 }
 
-/** As an admin: allow `account` one more join. Sent under our own account. */
+/** Whether we are waiting on an admin to approve our own reset. */
+export function hasOwnResetRequest(groupId: string): boolean {
+  return ownRequests.has(groupId);
+}
+
+/**
+ * As an admin: allow `account` one more join. Sent under our own account. Approving spends
+ * the object named by the request's proof, when it has a verified one.
+ */
 export async function approvePersonasReset(
   conversation: ConversationModel,
   account: string
@@ -344,8 +354,12 @@ export async function approvePersonasReset(
     return { ok: false, reason: 'only a group admin can approve a reset' };
   }
   const groupId = groupIdOf(conversation);
+  const request = groupId ? receivedIn(groupId).get(account) : undefined;
+  const proof = request?.proofOk ? request.proof : undefined;
   try {
-    const result = emitAndSelfIngest(groupId, engine => engine.emitRejoinApprove(account));
+    const result = emitAndSelfIngest(groupId, engine =>
+      engine.emitRejoinApprove(account, proof ? Buffer.from(proof, 'base64') : null)
+    );
     if (!result) {
       return { ok: false, reason: 'the personas engine is not ready' };
     }
@@ -409,6 +423,12 @@ export function recordSenderProblem(
     !(senderServiceId && conversation.isAdmin(senderServiceId as never))
   ) {
     return 'a ban from someone who is not a group admin';
+  }
+  if (
+    claim.kind === 'badge-approve' &&
+    !(senderServiceId && conversation.isAdmin(senderServiceId as never))
+  ) {
+    return 'a badge approval from someone who is not a group admin';
   }
   return undefined;
 }

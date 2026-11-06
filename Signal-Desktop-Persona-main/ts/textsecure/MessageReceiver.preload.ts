@@ -149,6 +149,7 @@ import {
   hasAnyPhantomCertificate,
   isExpectedPhantomCertificate,
 } from '../services/personasPhantomCert.std.ts';
+import { settleOwnRecord } from '../services/personasRegistry.std.ts';
 import { createLogger } from '../logging/log.std.ts';
 import { diffArraysAsSets } from '../util/diffArraysAsSets.std.ts';
 import { generateBlurHash } from '../util/generateBlurHash.std.ts';
@@ -329,6 +330,9 @@ export default class MessageReceiver
   // Grows at runtime: a personas member admits its phantom trust root when the bundle
   // arrives, which can be after boot (see addServerTrustRoot).
   readonly #serverTrustRoots: Array<PublicKey>;
+  // Personas demo: trust roots from phantom bundles. Each is held by whoever minted the
+  // bundle, so it vouches for the phantom certificate and for no one else.
+  readonly #phantomTrustRoots: Array<PublicKey> = [];
   #stoppingProcessing?: boolean;
   #pniIdentityKeyCheckRequired?: boolean;
 
@@ -1675,7 +1679,9 @@ export default class MessageReceiver
 
     if (
       !certificate.validateWithTrustRoots(
-        this.#serverTrustRoots,
+        certificate.senderUuid() === PHANTOM_SENDER_ACI
+          ? this.#phantomTrustRoots
+          : this.#serverTrustRoots,
         serverTimestamp
       )
     ) {
@@ -1688,10 +1694,10 @@ export default class MessageReceiver
   // Personas demo: admit the phantom bundle's trust root once this member holds it.
   addServerTrustRoot(base64: string): void {
     const key = PublicKey.deserialize(Bytes.fromBase64(base64));
-    if (this.#serverTrustRoots.some(existing => existing.equals(key))) {
+    if (this.#phantomTrustRoots.some(existing => existing.equals(key))) {
       return;
     }
-    this.#serverTrustRoots.push(key);
+    this.#phantomTrustRoots.push(key);
     log.info('MessageReceiver: added a server trust root (personas phantom)');
   }
 
@@ -2048,6 +2054,11 @@ export default class MessageReceiver
 
       // We don't do anything if it's just a duplicated message
       if (LibSignalErrorBase.is(error, LibSignalErrorCode.DuplicatedMessage)) {
+        // Personas: this is how a sender's own phantom message comes back. Its envelope
+        // says where every other member placed the record.
+        if (uuid === PHANTOM_SENDER_ACI) {
+          settleOwnRecord(envelope.timestamp, envelope.serverTimestamp);
+        }
         this.#removeFromCache(envelope);
         throw error;
       }

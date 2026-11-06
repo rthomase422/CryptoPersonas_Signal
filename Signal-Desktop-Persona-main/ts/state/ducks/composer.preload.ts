@@ -35,6 +35,7 @@ import type { StateType as RootStateType } from '../reducer.preload.ts';
 import { createLogger } from '../../logging/log.std.ts';
 import * as Errors from '../../types/errors.std.ts';
 import type { PollCreateType } from '../../types/Polls.dom.ts';
+import type { PreparedPersonaPost } from '../../services/personasRegistry.std.ts';
 import { enqueuePollCreateForSend } from '../../util/enqueuePollCreateForSend.dom.ts';
 import {
   ADD_PREVIEW as ADD_LINK_PREVIEW,
@@ -50,6 +51,7 @@ import { SafetyNumberChangeSource } from '../../types/SafetyNumberChangeSource.s
 import { assignWithNoUnnecessaryAllocation } from '../../util/assignWithNoUnnecessaryAllocation.std.ts';
 import {
   composePersonaPost,
+  personaScanRequired,
   heldBadges,
   isPersonasEngineEnabled,
   type PersonaChoice,
@@ -154,6 +156,7 @@ import {
   dismissResetRequest as doDismissResetRequest,
   requestPersonasReset as doRequestPersonaReset,
 } from '../../services/personasReset.preload.ts';
+import { encodePostText } from '../../services/personasCarriage.std.ts';
 
 const { debounce, isEqual } = lodash;
 
@@ -341,7 +344,7 @@ export function personaTopicLearned(
   return { type: PERSONA_TOPIC_LEARNED, payload: { groupId, name, context } };
 }
 
-// Create a topic: draws a random context, announces it to the group, and records it
+// Create a topic: announces it to the group, and records it
 // locally so the composer can immediately offer it.
 function createPersonaTopic(
   conversationId: string,
@@ -1194,16 +1197,8 @@ function sendMultiMediaMessage(
       // Personas demo: a persona post is emitted as a ZK record here; the model
       // keeps the plaintext for display, and the send path swaps in the record
       // (personaRecordBase64) for the wire.
-      let personaFields:
-        | {
-            persona?: string;
-            personaFlagged?: boolean;
-            personaEh?: string;
-            personaAnonymous?: boolean;
-            personaRecordBase64?: string;
-            personaBadge?: string;
-            personaContextName?: string;
-          }
+      let preparePersonaPost:
+        | (() => Promise<PreparedPersonaPost | undefined>)
         | undefined;
       if (options.personaChoice && message) {
         // Phase 6: never emit before membership exists. Un-joined, `emitPostPseudo`
@@ -1260,94 +1255,112 @@ function sendMultiMediaMessage(
           });
           return;
         }
-        // NEVER SCAN BECAUSE A POST IS ABOUT TO GO OUT: a scan right before a post links
-        // the two. Scans run on the public schedule (personasScanSchedule). The one wait
-        // here is for a sweep already under way, because the engine refuses a post until
-        // it ends.
-        if (!(await ensureReadyForPersonaAction(conversation))) {
-          log.error(
-            'sendMultiMediaMessage: callback sweep would not finish; refusing to send ' +
-            'rather than letting the post be rejected mid-flight'
-          );
-          dispatch(
-            showToast({
-              toastType: ToastType.PersonaActionFailed,
-              parameters: {
-                reason:
-                  'a callback sweep is unfinished — open Persona status and press Scan now',
-              },
-            })
-          );
-          return;
-        }
+        // Shown to the member as sending right away, and proved in the background: a post
+        // may have to wait for their last action to settle.
+        const { personaChoice } = options;
+        preparePersonaPost = () =>
+          inPostOrder(conversationId, async () => {
+            // NEVER SCAN BECAUSE A POST IS ABOUT TO GO OUT: a scan right before a post links
+            // the two. Scans run on the public schedule (personasScanSchedule). The one wait
+            // here is for a sweep already under way, because the engine refuses a post until
+            // it ends.
+            if (!(await ensureReadyForPersonaAction(conversation))) {
+              log.error(
+                'sendMultiMediaMessage: callback sweep would not finish; refusing to send ' +
+                'rather than letting the post be rejected mid-flight'
+              );
+              dispatch(
+                showToast({
+                  toastType: ToastType.PersonaActionFailed,
+                  parameters: {
+                    reason:
+                      'a callback sweep is unfinished — open Persona status and press Scan now',
+                  },
+                })
+              );
+              return undefined;
+            }
 
-        const post = composePersonaPost(personasGroupId, message, options.personaChoice);
-        if (!post) {
-          log.error(
-            'sendMultiMediaMessage: persona post emit failed; refusing to send attributably'
-          );
-          dispatch({
-            type: SHOW_TOAST,
-            payload: { toastType: ToastType.Error },
+            if (personaScanRequired(personasGroupId)) {
+              log.warn('sendMultiMediaMessage: post limit reached until the next sweep');
+              dispatch(
+                showToast({
+                  toastType: ToastType.PersonaActionFailed,
+                  parameters: {
+                    reason:
+                      'you have reached the post limit — open Persona status and press Scan now',
+                  },
+                })
+              );
+              return undefined;
+            }
+            // The badge to ride alongside this post — only if the member's own zk object
+            // actually CONTAINS it. Read at send time rather than baked into the choice so
+            // toggling it takes effect on the next message without re-picking a persona.
+            //
+            // `getSelectedBadgeIfHeld`, never `getSelectedBadge`: the selection is a
+            // preference file that survives a reset and was writable by earlier builds, so
+            // reading it directly let a merely-REQUESTED badge ride out on every post.
+            // Narrowing the composer menu did not fix that, because the menu is not on
+            // this path. The gate has to be here, where the claim reaches the wire.
+            const personaBadge = getSelectedBadgeIfHeld(personasGroupId);
+            // Only a RATE-LIMITED persona has a context; an unlimited pseudonym and an
+            // anonymous post deliberately have none, and the absence of the chip is what
+            // distinguishes them in the timeline.
+            // Whatever context the composer had selected, or the rate-limited
+            // persona's own context as a fallback when the UI did not supply one.
+            const personaContextName =
+              options.personaContextName ??
+              (personaChoice.kind === 'rate'
+                ? (personasGroupId &&
+                    nameForContext(personasGroupId, personaChoice.context)) ||
+                  undefined
+                : undefined);
+            const post = composePersonaPost(
+              personasGroupId,
+              encodePostText({
+                text: message,
+                badge: personaBadge,
+                contextName: personaContextName,
+              }),
+              personaChoice
+            );
+            if (!post) {
+              log.error(
+                'sendMultiMediaMessage: persona post emit failed; refusing to send attributably'
+              );
+              dispatch({
+                type: SHOW_TOAST,
+                payload: { toastType: ToastType.Error },
+              });
+              return undefined;
+            }
+            // The engine only tells us a pseudonym's petname when it emits under it, so
+            // this is where an unlimited persona's name becomes known.
+            if (personaChoice.kind === 'pseudo' && post.persona) {
+              if (personasGroupId) {
+                recordPetname(personasGroupId, personaChoice.nonce, post.persona);
+              }
+            }
+            const personaFields = {
+              persona: post.persona,
+              personaFlagged: false,
+              personaEh: post.eh,
+              // emitPostAnon yields no petname; mark it so our own copy renders
+              // "Anonymous" instead of falling through to the phantom contact.
+              personaAnonymous: post.persona == null,
+              personaRecordBase64: post.personaRecordBase64,
+              personaBadge,
+              personaContextName,
+            };
+            log.info(
+              `personas: sending post choice=${JSON.stringify(personaChoice)} ` +
+              `persona=${personaFields.persona ?? '(anonymous)'} ` +
+              `context=${personaFields.personaContextName ?? '(none)'} ` +
+              `badge=${personaFields.personaBadge ?? '(none)'}`
+            );
+            return personaFields;
           });
-          return;
-        }
-        // The engine only tells us a pseudonym's petname when it emits under it, so
-        // this is where an unlimited persona's name becomes known.
-        if (options.personaChoice.kind === 'pseudo' && post.persona) {
-          if (personasGroupId) {
-            recordPetname(personasGroupId, options.personaChoice.nonce, post.persona);
-          }
-        }
-        personaFields = {
-          persona: post.persona,
-          personaFlagged: false,
-          personaEh: post.eh,
-          // emitPostAnon yields no petname; mark it so our own copy renders
-          // "Anonymous" instead of falling through to the phantom contact.
-          personaAnonymous: post.persona == null,
-          personaRecordBase64: post.personaRecordBase64,
-          // The badge to ride alongside this post — only if the member's own zk object
-          // actually CONTAINS it. Read at send time rather than baked into the choice so
-          // toggling it takes effect on the next message without re-picking a persona.
-          //
-          // `getSelectedBadgeIfHeld`, never `getSelectedBadge`: the selection is a
-          // preference file that survives a reset and was writable by earlier builds, so
-          // reading it directly let a merely-REQUESTED badge ride out on every post.
-          // Narrowing the composer menu did not fix that, because the menu is not on
-          // this path. The gate has to be here, where the claim reaches the wire.
-          personaBadge: getSelectedBadgeIfHeld(personasGroupId),
-          // Only a RATE-LIMITED persona has a context; an unlimited pseudonym and an
-          // anonymous post deliberately have none, and the absence of the chip is what
-          // distinguishes them in the timeline.
-          // Whatever context the composer had selected, or the rate-limited
-          // persona's own context as a fallback when the UI did not supply one.
-          personaContextName:
-            options.personaContextName ??
-            (options.personaChoice.kind === 'rate'
-              ? personasGroupId &&
-                nameForContext(personasGroupId, options.personaChoice.context)
-              : undefined),
-        };
-      }
-
-      // DIAGNOSTIC, paired with the one in handleDataMessage. Together they localize a
-      // missing context chip to exactly one of two places: a sender that never attached
-      // the name, or a receiver that did not decode it. `personaTopic` lives in
-      // CompositionArea's local state, so it is also the thing that would silently go
-      // undefined if that component ever remounted between sends.
-      if (personaFields != null) {
-        // `personaFields` holds the EMITTED result (petname, eh, record), not the
-        // request. An earlier version of this line looked for `personaChoice` on it and
-        // always printed "(none)", which read as "no persona was used" on posts that
-        // plainly had one — a diagnostic that invented a second bug. Log both sides:
-        // the choice that was asked for, and the persona that came back.
-        log.info(
-          `personas: sending post choice=${JSON.stringify(options.personaChoice)} ` +
-          `persona=${personaFields.persona ?? '(anonymous)'} ` +
-          `context=${personaFields.personaContextName ?? '(none)'} ` +
-          `badge=${personaFields.personaBadge ?? '(none)'}`
-        );
       }
 
       try {
@@ -1359,11 +1372,12 @@ function sendMultiMediaMessage(
             preview: getLinkPreviewForSend(message),
             bodyRanges,
             isViewOnce,
-            ...personaFields,
+            personaAnonymous: options.personaChoice?.kind === 'anon' || undefined,
           },
           {
             sendHQImages,
             timestamp,
+            preparePersonaPost,
             // We rely on enqueueMessageForSend to call these within redux's batch
             extraReduxActions: () => {
               conversation.setMarkedUnread(false);
@@ -1395,6 +1409,19 @@ function sendMultiMediaMessage(
       }
     });
   };
+}
+
+// A member's posts go out in the order they were written, whatever each one waits for.
+const personaPostOrder = new Map<string, Promise<unknown>>();
+
+function inPostOrder<T>(
+  conversationId: string,
+  prepare: () => Promise<T>
+): Promise<T> {
+  const previous = personaPostOrder.get(conversationId) ?? Promise.resolve();
+  const next = previous.then(prepare, prepare);
+  personaPostOrder.set(conversationId, next);
+  return next;
 }
 
 function sendStickerMessage(

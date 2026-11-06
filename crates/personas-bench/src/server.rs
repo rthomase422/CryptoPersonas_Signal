@@ -44,7 +44,7 @@ use url::Url;
 use crate::{Args, Summary, machine, micros, summarize};
 
 /// Posts a member can make before it must scan (`NUM_INTS_BEFORE_SCAN`, minus slack).
-const POSTS_PER_MEMBER: usize = 150;
+const POSTS_PER_MEMBER: usize = 15;
 /// The most `--load-requests`: at concurrency 1 one member takes every ticket, and the
 /// levels together must stay under that same cap.
 const MAX_LOAD_REQUESTS: usize = 128;

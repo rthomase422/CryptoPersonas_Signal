@@ -40,7 +40,7 @@ use crate::merkle::{MerkleCallbackStore, MerkleObjStore};
 
 // Tiny heights keep the circuits small; the mechanism under test is
 // height-independent (d1's e2e tests make the same choice).
-const OH: usize = 4;
+const OH: usize = 32;
 const MH: usize = 4;
 const NH: usize = 4;
 type ObjT = MerkleObjStore<F, OH>;
@@ -57,10 +57,7 @@ fn scan_keys(rng: &mut StdRng, cstore: &CbT) -> (PK, VK) {
 }
 
 fn pseudonym_pred_keys(rng: &mut StdRng) -> (PK, VK) {
-    let dummy = PseudonymArgs {
-        context: F::from(0),
-        claimed: F::from(0),
-    };
+    let dummy = PseudonymArgs::default();
     generate_keys_for_statement_in::<
         F,
         H,
@@ -85,6 +82,7 @@ fn standard_only_keys(vk: &VK) -> ReplicaKeys {
         pseudonym_pred: vk.clone(),
         badge_request: vk.clone(),
         join: vk.clone(),
+        not_banned: vk.clone(),
     }
 }
 
@@ -95,6 +93,7 @@ fn make_user(rng: &mut StdRng) -> (User<F, MsgUser>, Record) {
         object: Ark(user.commit::<H>()),
         old_nul: Ark(F::from(0)),
         account: Ark(user.commit::<H>()),
+        pk: Ark(user.commit::<H>()),
         proof: Ark(Default::default()),
     };
     (user, join)
@@ -125,7 +124,7 @@ fn anon_post(
             obj,
             false,
             pk,
-            F::from(0),
+            super::record::post_payload(body),
             (),
         )
         .expect("post proof");
@@ -134,6 +133,7 @@ fn anon_post(
         exec: Ark(exec),
         extra: Ark(vec![]),
         body: body.into(),
+        payload: Ark(super::record::post_payload(body)),
         obj_root: Ark(obj.root()),
     }
 }
@@ -158,11 +158,13 @@ fn e2e_convergence_out_of_order_delivery() {
     // apply both records.
     let mut roots = Vec::new();
     for order in [vec![&join_b, &post_b], vec![&post_b, &join_b]] {
-        let mut r = Replica::<OH, MH, NH>::new(keys.clone(), Config::default())
+        let mut r = Replica::<OH, MH, NH>::new(keys.clone(), Config::fast())
             .trust_unproven_joins_for_tests();
         for bytes in order {
             r.ingest(bytes.clone()).unwrap();
         }
+        // A root is produced when its barrier closes.
+        r.barrier();
         assert_eq!(r.status(&join_eh), Some(Status::Applied));
         assert_eq!(
             r.status(&post_eh),
@@ -208,11 +210,12 @@ fn e2e_double_spend_resolves_to_one_winner_everywhere() {
         vec![&b_by, &a_by, &join_by],
         vec![&a_by, &join_by, &b_by],
     ] {
-        let mut r = Replica::<OH, MH, NH>::new(keys.clone(), Config::default())
+        let mut r = Replica::<OH, MH, NH>::new(keys.clone(), Config::fast())
             .trust_unproven_joins_for_tests();
         for bytes in order {
             r.ingest(bytes.clone()).unwrap();
         }
+        r.barrier();
         assert_eq!(r.status(&winner), Some(Status::Applied), "smaller eh wins");
         assert_eq!(
             r.status(&loser),
@@ -237,6 +240,7 @@ fn full_keys(std_vk: &VK, scan_vk: &VK, pred_vk: &VK) -> ReplicaKeys {
         pseudonym_pred: pred_vk.clone(),
         badge_request: std_vk.clone(),
         join: std_vk.clone(),
+        not_banned: std_vk.clone(),
     }
 }
 
@@ -257,6 +261,7 @@ fn join_of(user: &User<F, MsgUser>) -> (F, Vec<u8>, Eh) {
         object: Ark(user.commit::<H>()),
         old_nul: Ark(F::from(0)),
         account: Ark(user.commit::<H>()),
+        pk: Ark(user.commit::<H>()),
         proof: Ark(Default::default()),
     };
     let (b, eh) = encode(&rec).unwrap();
@@ -280,7 +285,11 @@ fn ban_vote(
     )
     .unwrap();
     assert_eq!(root, root_joined);
-    let pseudo = PseudonymArgs { context, claimed };
+    let pseudo = PseudonymArgs {
+        context,
+        claimed,
+        payload: super::record::ballot_payload(poll, BAN_OPTION),
+    };
     let proof = voter
         .prove_statement_and_in::<H, PseudonymArgs<F>, PseudonymArgsVar<F>, (), (), Snark, ObjT>(
             rng,
@@ -394,7 +403,7 @@ fn e2e_ban_propagates_and_absorbs_and_stale_scan_rejected() {
             &shadow_joined,
             false,
             &std_pk,
-            F::from(0),
+            super::record::post_payload("the offending post"),
             (),
         )
         .expect("post proof");
@@ -407,6 +416,7 @@ fn e2e_ban_propagates_and_absorbs_and_stale_scan_rejected() {
         exec: Ark(p_exec),
         extra: Ark(vec![]),
         body: "the offending post".into(),
+        payload: Ark(super::record::post_payload("the offending post")),
         obj_root: Ark(root_joined),
     };
     let (post_b, post_eh) = encode(&post).unwrap();
@@ -458,7 +468,12 @@ fn e2e_ban_propagates_and_absorbs_and_stale_scan_rejected() {
     for order in orders {
         let mut r =
             Replica::<OH, MH, NH>::new(keys.clone(), config).trust_unproven_joins_for_tests();
-        for &i in &order {
+        // The joins' barrier closes, and the records proved against its root follow.
+        for &i in order.iter().filter(|i| **i < 3) {
+            r.ingest(base[i].clone()).unwrap();
+        }
+        r.barrier();
+        for &i in order.iter().filter(|i| **i >= 3) {
             r.ingest(base[i].clone()).unwrap();
         }
         assert_eq!(r.status(&post_eh), Some(Status::Applied), "post applied");
@@ -485,7 +500,11 @@ fn e2e_ban_propagates_and_absorbs_and_stale_scan_rejected() {
 
     // Prepare a replica that has seen the ban, for the scan assertions.
     let mut r = Replica::<OH, MH, NH>::new(keys.clone(), config).trust_unproven_joins_for_tests();
-    for bytes in &base {
+    for bytes in &base[..3] {
+        r.ingest(bytes.clone()).unwrap();
+    }
+    r.barrier();
+    for bytes in &base[3..] {
         r.ingest(bytes.clone()).unwrap();
     }
     r.barrier();
@@ -545,7 +564,13 @@ fn verifying_with_a_prepared_key_gives_the_same_answers() {
     let (mut user, join) = make_user(&mut rng);
     let mut obj = ObjT::new();
     obj.push(join_object(&join), F::from(0), vec![]);
-    let Record::Post { exec, obj_root, .. } = anon_post(&mut rng, &mut user, &obj, &pk, "x") else {
+    let Record::Post {
+        exec,
+        obj_root,
+        payload,
+        ..
+    } = anon_post(&mut rng, &mut user, &obj, &pk, "x")
+    else {
         unreachable!()
     };
     let exec = exec.0;
@@ -577,7 +602,7 @@ fn verifying_with_a_prepared_key_gives_the_same_answers() {
             &fresh,
             object,
             nul,
-            F::from(0),
+            payload.0,
             exec.cb_com_list,
             exec.proof.clone(),
             Some(root),
@@ -590,7 +615,7 @@ fn verifying_with_a_prepared_key_gives_the_same_answers() {
             &prepared,
             object,
             nul,
-            F::from(0),
+            payload.0,
             exec.cb_com_list,
             &exec.proof,
             root,
@@ -603,26 +628,11 @@ fn verifying_with_a_prepared_key_gives_the_same_answers() {
     }
 }
 
-/// Rewrite a record's content and re-encode it until `accept` likes its envelope hash.
-/// The `view` claim is outside every proof, so it grinds the hash for free.
-fn regrind(
-    bytes: &[u8],
-    mutate: &dyn Fn(&mut Record),
-    accept: &dyn Fn(Eh) -> bool,
-) -> (Vec<u8>, Eh) {
-    for k in 0u64.. {
-        let (mut rec, _) = super::record::decode(bytes).unwrap();
-        mutate(&mut rec);
-        let claim = super::record::ViewClaim {
-            barrier: k,
-            digest: [0; 32],
-        };
-        let (b, eh) = super::record::encode_with_view(&rec, Some(claim)).unwrap();
-        if accept(eh) {
-            return (b, eh);
-        }
-    }
-    unreachable!()
+/// A record's bytes after rewriting it the way a relaying member could.
+fn rewrite(bytes: &[u8], mutate: &dyn Fn(&mut Record)) -> (Vec<u8>, Eh) {
+    let (mut rec, _) = super::record::decode(bytes).unwrap();
+    mutate(&mut rec);
+    encode(&rec).unwrap()
 }
 
 /// What the audit's content tests share: two joined members, and an honest post with its
@@ -663,7 +673,7 @@ fn audit_setup() -> AuditSetup {
             &shadow,
             false,
             &std_pk,
-            F::from(0),
+            super::record::post_payload("honest text"),
             (),
         )
         .expect("post proof");
@@ -672,6 +682,7 @@ fn audit_setup() -> AuditSetup {
         exec: Ark(exec),
         extra: Ark(vec![]),
         body: "honest text".into(),
+        payload: Ark(super::record::post_payload("honest text")),
         obj_root: Ark(root),
     };
     let (post, post_eh) = encode(&post).unwrap();
@@ -698,35 +709,41 @@ fn audit_replica(s: &AuditSetup) -> Replica<OH, MH, NH> {
     for j in &s.joins {
         r.ingest_at(j.1.clone(), 0).unwrap();
     }
+    r.advance_to(1);
     r
 }
 
-/// Audit C1: a member keeps a post's proof, changes its text and grinds a smaller hash.
-/// The forgery has to be refused, and the author's post has to stand.
+/// Audit C1: a member keeps a post's proof and changes its text. Neither copy of the
+/// forgery may stand, whichever arrives first, and the author's post must.
 #[test]
-#[ignore = "audit C1: open until payloads are public inputs (real proofs; --release)"]
+#[ignore = "generates real Groth16 keys/proofs; run with --release --ignored"]
 fn a_post_body_cannot_be_rewritten_under_its_proof() {
     let s = audit_setup();
     let honest = s.post_eh;
-    let (forged, forged_eh) = regrind(
-        &s.post,
-        &|r| {
-            if let Record::Post { body, .. } = r {
-                *body = "FORGED text".into();
-            }
-        },
-        &|eh| eh < honest,
-    );
+    // Same payload: the same identity, with text that does not match it.
+    let (mismatched, _) = rewrite(&s.post, &|r| {
+        if let Record::Post { body, .. } = r {
+            *body = "FORGED text".into();
+        }
+    });
+    // The payload rewritten to match: a new identity, and a proof about another payload.
+    let (forged, forged_eh) = rewrite(&s.post, &|r| {
+        if let Record::Post { body, payload, .. } = r {
+            *body = "FORGED text".into();
+            payload.0 = super::record::post_payload("FORGED text");
+        }
+    });
     let mut r = audit_replica(&s);
-    r.ingest_at(s.post.clone(), 0).unwrap();
+    r.ingest_at(mismatched, 0).unwrap();
     r.ingest_at(forged, 0).unwrap();
+    r.ingest_at(s.post.clone(), 0).unwrap();
     assert_eq!(r.status(&honest), Some(Status::Applied));
-    assert!(matches!(r.status(&forged_eh), Some(Status::Rejected(_))));
+    assert_eq!(r.status(&forged_eh), None);
 }
 
 /// Audit C1: changing a ballot's option under its proof must not change the tally.
 #[test]
-#[ignore = "audit C1: open until payloads are public inputs (real proofs; --release)"]
+#[ignore = "generates real Groth16 keys/proofs; run with --release --ignored"]
 fn a_ballot_cannot_be_flipped_under_its_proof() {
     let mut s = audit_setup();
     let poll = Record::PollOpen {
@@ -736,7 +753,7 @@ fn a_ballot_cannot_be_flipped_under_its_proof() {
         target: Some(s.post_eh),
     };
     let (poll_bytes, poll_eh) = encode(&poll).unwrap();
-    let (vote, vote_eh) = ban_vote(
+    let (vote, _) = ban_vote(
         &mut s.rng,
         &s.voter,
         &s.shadow,
@@ -744,35 +761,55 @@ fn a_ballot_cannot_be_flipped_under_its_proof() {
         poll_eh,
         &s.pred_pk,
     );
-    let (flipped, _) = regrind(
-        &vote,
-        &|r| {
-            if let Record::Vote { option, .. } = r {
-                *option = super::tally::KEEP_OPTION;
-            }
-        },
-        &|eh| eh > vote_eh,
-    );
+    let (flipped, _) = rewrite(&vote, &|r| {
+        if let Record::Vote { option, .. } = r {
+            *option = super::tally::KEEP_OPTION;
+        }
+    });
     let mut r = audit_replica(&s);
-    r.ingest_at(s.post.clone(), 0).unwrap();
-    r.ingest_at(poll_bytes, 0).unwrap();
-    r.ingest_at(vote, 0).unwrap();
+    r.ingest_at(s.post.clone(), 1).unwrap();
+    r.ingest_at(poll_bytes, 1).unwrap();
+    r.ingest_at(vote, 1).unwrap();
     assert_eq!(r.poll(&poll_eh).unwrap().ban_tally(), (1, 0));
-    r.ingest_at(flipped, 0).unwrap();
+    r.ingest_at(flipped, 1).unwrap();
     assert_eq!(r.poll(&poll_eh).unwrap().ban_tally(), (1, 0));
 }
 
 /// Beyond the audit: a Groth16 proof can be re-randomized and `view` is outside it, so a
-/// copy of a post with the SAME text can still take a smaller hash. Bans and ratings
-/// aimed at the original must keep working, so that copy has to be the same record.
+/// copy of a post can be re-encoded. Bans and ratings aimed at the original must keep
+/// working, so the copy has to be the same record.
 #[test]
-#[ignore = "open until a record's identity excludes its proof bytes and view (real proofs; --release)"]
-fn a_recoded_copy_of_a_post_does_not_displace_it() {
+#[ignore = "generates real Groth16 keys/proofs; run with --release --ignored"]
+fn a_recoded_copy_of_a_post_is_the_same_record() {
     let s = audit_setup();
-    let honest = s.post_eh;
-    let (copy, _) = regrind(&s.post, &|_| {}, &|eh| eh < honest);
+    let (rec, _) = super::record::decode(&s.post).unwrap();
+    let claim = super::record::ViewClaim {
+        barrier: 7,
+        digest: [1; 32],
+    };
+    let (copy, copy_eh) = super::record::encode_with_view(&rec, Some(claim)).unwrap();
+    assert_eq!(copy_eh, s.post_eh);
     let mut r = audit_replica(&s);
-    r.ingest_at(s.post.clone(), 0).unwrap();
     r.ingest_at(copy, 0).unwrap();
-    assert_eq!(r.status(&honest), Some(Status::Applied));
+    r.ingest_at(s.post.clone(), 0).unwrap();
+    assert_eq!(r.status(&s.post_eh), Some(Status::Applied));
+}
+
+/// Beyond the audit: the proof covers a ticket's commitment and the replica invokes the
+/// published ticket. Publishing another one would make a post that no ban can reach.
+#[test]
+#[ignore = "generates real Groth16 keys/proofs; run with --release --ignored"]
+fn a_post_cannot_publish_a_ticket_its_proof_did_not_commit_to() {
+    let s = audit_setup();
+    let (swapped, _) = rewrite(&s.post, &|r| {
+        if let Record::Post { exec, .. } = r {
+            exec.0.cb_tik_list[0].0.com_rand = F::from(12345u64);
+        }
+    });
+    let mut r = audit_replica(&s);
+    let refused = r.ingest_at(swapped, 0).unwrap();
+    assert!(matches!(refused, Status::Rejected(_)));
+    // A refused copy leaves the identity free for the real record.
+    r.ingest_at(s.post.clone(), 0).unwrap();
+    assert_eq!(r.status(&s.post_eh), Some(Status::Applied));
 }

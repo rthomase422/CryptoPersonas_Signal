@@ -37,26 +37,29 @@ use ark_relations::r1cs::SynthesisError;
 use rand::{CryptoRng, RngCore};
 
 use personas_bulletin::merkle::{MerkleCallbackStore, MerkleObjStore};
-use personas_bulletin::replica::record::{Ark, Eh, Flavour, PollKind, Record};
+use personas_bulletin::replica::record::{
+    Ark, Eh, Flavour, PollKind, Record, ballot_payload, post_payload, rating_payload,
+};
 use personas_core::circuits::{
-    BadgesArgs, BadgesArgsVar, MsgUser, NUM_SCANS_PER_FOLD, PrivScan, PrivScanVar, PseudonymArgs,
+    BadgesArgs, BadgesArgsVar, JoinArgs, JoinArgsVar, MsgUser, NUM_SCANS_PER_FOLD, PrivScan, PrivScanVar, PseudonymArgs,
     PseudonymArgsPair, PseudonymArgsPairVar, PseudonymArgsRate, PseudonymArgsVar, PubScan,
-    PubScanVar, authorship_pred, badge_pred, get_badge_request_interaction, get_callbacks,
-    get_scan_interaction, get_standard_interaction, get_standard_pseudo_interaction,
+    PubScanVar, ResetArgs, ResetArgsVar, authorship_pred, badge_pred, get_badge_request_interaction, get_callbacks,
+    get_dummy_scan_interaction, get_scan_interaction, get_standard_interaction, get_standard_pseudo_interaction,
     get_standard_pseudo_rate_interaction, join_pred, not_banned_pred, pseudonym_pred,
 };
 use personas_core::params::ServerKeys;
 use personas_core::{Args, ArgsVar, Cr, F, H, PK, Snark, persona};
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use zk_callbacks::generic::bulletin::PublicUserBul;
+use personas_bulletin::merkle::params::merkle_scan_pubdata;
+use zk_callbacks::generic::bulletin::{PublicCallbackBul, PublicUserBul};
 use zk_callbacks::generic::object::Time;
 use zk_callbacks::generic::user::User;
 use zk_callbacks::impls::centralized::crypto::FakeSigPubkey;
 
 /// How far below `NUM_INTS_BEFORE_SCAN` a member starts scanning even with nothing to
 /// absorb, so it never reaches the cap.
-const SCAN_CAP_MARGIN: usize = 20;
+const SCAN_CAP_MARGIN: usize = 5;
 
 /// A member could not build a record.
 #[derive(Debug, thiserror::Error)]
@@ -69,6 +72,10 @@ pub enum MemberError {
     /// A scan needs at least `NUM_SCANS_PER_FOLD` outstanding callbacks to answer.
     #[error("nothing to scan: {have} outstanding callbacks, need {need}")]
     NothingToScan { have: usize, need: usize },
+    #[error("a sweep is under way, so a dummy scan cannot run")]
+    SweepUnderway,
+    #[error("this member has used its interactions and must finish a scan first")]
+    ScanRequired,
     /// Groth16 proving failed.
     #[error("proof generation failed: {0}")]
     Proof(#[from] SynthesisError),
@@ -257,17 +264,21 @@ impl Member {
         if !self.is_fresh() {
             return Err(MemberError::NotFresh);
         }
-        let result = self.user.prove_statement::<H, F, FpVar<F>, (), (), Snark>(
-            rng,
-            join_pred,
-            &self.keys.join,
-            account,
-            (),
-        )?;
+        let pk = persona::member_pk(&self.user.data.sk);
+        let result = self
+            .user
+            .prove_statement::<H, JoinArgs<F>, JoinArgsVar<F>, (), (), Snark>(
+                rng,
+                join_pred,
+                &self.keys.join,
+                JoinArgs { account, pk },
+                (),
+            )?;
         Ok(Record::Join {
             object: Ark(result.object),
             old_nul: Ark(F::from(0)),
             account: Ark(account),
+            pk: Ark(pk),
             proof: Ark(result.proof),
         })
     }
@@ -291,13 +302,13 @@ impl Member {
             && self.user.num_outstanding_callbacks() == 0
     }
 
-    /// Start over as a brand-new member: a fresh object under a new secret key. Used
-    /// after an admin approved a re-join; the old object (its reputation, badges and
-    /// pseudonyms) is abandoned.
+    /// Start over with a fresh object under the SAME secret key. Used after an admin
+    /// approved a re-join; the old object's reputation and badges are abandoned. Keeping
+    /// the key keeps this member's pseudonyms, so it cannot vote or rate twice.
     pub fn reset(&mut self, rng: &mut (impl CryptoRng + RngCore)) {
         self.user = User::create(
             MsgUser {
-                sk: F::rand(rng),
+                sk: self.user.data.sk,
                 ..Default::default()
             },
             rng,
@@ -305,14 +316,14 @@ impl Member {
     }
 
     /// Prove this member is NOT BANNED and has just completed a scan sweep, against
-    /// `obj`'s current root (`not_banned_pred`, public inputs `[account, root]`). What a
-    /// reset request carries. Returns `(root, proof)`.
+    /// `obj`'s current root (`not_banned_pred`, public inputs `[account, nul, root]`). What
+    /// a reset request carries. Returns `(nul, root, proof)`.
     pub fn not_banned<const OH: usize>(
         &self,
         rng: &mut (impl CryptoRng + RngCore),
         obj: &MerkleObjStore<F, OH>,
         account: F,
-    ) -> Result<(F, <Snark as ark_snark::SNARK<F>>::Proof), MemberError> {
+    ) -> Result<(F, F, <Snark as ark_snark::SNARK<F>>::Proof), MemberError> {
         let zero = F::from(0u64);
         if self.user.data.banned != zero {
             return Err(MemberError::NotBannedUnprovable("this member is banned"));
@@ -330,19 +341,20 @@ impl Member {
                 self.commitment(),
             )
             .ok_or(MemberError::NotJoined)?;
+        let nul = self.user.zk_fields.nul;
         let proof = self
             .user
-            .prove_statement_and_in::<H, F, FpVar<F>, (), (), Snark, MerkleObjStore<F, OH>>(
+            .prove_statement_and_in::<H, ResetArgs<F>, ResetArgsVar<F>, (), (), Snark, MerkleObjStore<F, OH>>(
                 rng,
                 not_banned_pred,
                 &self.keys.not_banned,
                 (path, root),
                 // Merkle membership: the root is a public input (see `badge`).
                 false,
-                account,
+                ResetArgs { account, nul },
                 (),
             )?;
-        Ok((root, proof))
+        Ok((nul, root, proof))
     }
 
     /// An anonymous post against the object tree's current root.
@@ -352,8 +364,10 @@ impl Member {
         obj: &MerkleObjStore<F, OH>,
         body: impl Into<String>,
     ) -> Result<Record, MemberError> {
-        self.require_member(obj)?;
+        self.require_allowance(obj)?;
         let root = obj.root();
+        let body = body.into();
+        let payload = post_payload(&body);
         let exec = self
             .user
             .exec_method_create_cb::<H, F, FpVar<F>, (), (), Args, ArgsVar, Cr, Snark, MerkleObjStore<F, OH>, 1>(
@@ -364,14 +378,15 @@ impl Member {
                 obj,
                 false,
                 &self.keys.standard,
-                F::from(0),
+                payload,
                 (),
             )?;
         Ok(Record::Post {
             flavour: Flavour::Anon,
             exec: Ark(exec),
             extra: Ark(vec![]),
-            body: body.into(),
+            body,
+            payload: Ark(payload),
             obj_root: Ark(root),
         })
     }
@@ -393,7 +408,7 @@ impl Member {
         obj: &MerkleObjStore<F, OH>,
         slot: u8,
     ) -> Result<Record, MemberError> {
-        self.require_member(obj)?;
+        self.require_allowance(obj)?;
         let root = obj.root();
         let exec = self
             .user
@@ -431,10 +446,16 @@ impl Member {
         body: impl Into<String>,
         context: F,
     ) -> Result<Record, MemberError> {
-        self.require_member(obj)?;
+        self.require_allowance(obj)?;
         let root = obj.root();
+        let body = body.into();
+        let payload = post_payload(&body);
         let claimed = persona::pseudonym(&self.user.data.sk, &context);
-        let pseudo = PseudonymArgs { context, claimed };
+        let pseudo = PseudonymArgs {
+            context,
+            claimed,
+            payload,
+        };
         let exec = self
             .user
             .exec_method_create_cb::<H, PseudonymArgs<F>, PseudonymArgsVar<F>, (), (), Args, ArgsVar, Cr, Snark, MerkleObjStore<F, OH>, 1>(
@@ -452,7 +473,8 @@ impl Member {
             flavour: Flavour::Pseudo,
             exec: Ark(exec),
             extra: Ark(vec![context, claimed]),
-            body: body.into(),
+            body,
+            payload: Ark(payload),
             obj_root: Ark(root),
         })
     }
@@ -467,13 +489,16 @@ impl Member {
         context: F,
         i: F,
     ) -> Result<Record, MemberError> {
-        self.require_member(obj)?;
+        self.require_allowance(obj)?;
         let root = obj.root();
+        let body = body.into();
+        let payload = post_payload(&body);
         let claimed = persona::pseudonym_rate(&self.user.data.sk, &context, &i);
         let pseudo = PseudonymArgsRate {
             context,
             claimed,
             i,
+            payload,
         };
         let exec = self
             .user
@@ -492,7 +517,8 @@ impl Member {
             flavour: Flavour::PseudoRate,
             exec: Ark(exec),
             extra: Ark(vec![context, claimed, i]),
-            body: body.into(),
+            body,
+            payload: Ark(payload),
             obj_root: Ark(root),
         })
     }
@@ -507,7 +533,8 @@ impl Member {
         option: u32,
     ) -> Result<Record, MemberError> {
         let context = poll.context();
-        let (root, claimed, proof) = self.pseudonym_statement(rng, obj, context)?;
+        let payload = ballot_payload(poll, option);
+        let (root, claimed, proof) = self.pseudonym_statement(rng, obj, context, payload)?;
         Ok(Record::Vote {
             poll,
             option,
@@ -528,7 +555,8 @@ impl Member {
         delta: i8,
     ) -> Result<Record, MemberError> {
         let context = target.context();
-        let (root, claimed, proof) = self.pseudonym_statement(rng, obj, context)?;
+        let payload = rating_payload(target, delta);
+        let (root, claimed, proof) = self.pseudonym_statement(rng, obj, context, payload)?;
         Ok(Record::Rate {
             target,
             delta,
@@ -591,6 +619,49 @@ impl Member {
         })
     }
 
+    /// A scan that changes nothing: the same proof shape as [`Self::scan`], for filling a
+    /// member's fixed count of scans per epoch. Refused mid-sweep, where it would look like
+    /// progress and make none. Advances only the object's nullifier and randomness.
+    pub fn dummy_scan<const OH: usize, const MH: usize, const NH: usize>(
+        &mut self,
+        rng: &mut (impl CryptoRng + RngCore),
+        obj: &MerkleObjStore<F, OH>,
+        cbs: &MerkleCallbackStore<F, MH, NH>,
+    ) -> Result<Record, MemberError> {
+        self.require_member(obj)?;
+        if self.user.is_scanning() {
+            return Err(MemberError::SweepUnderway);
+        }
+        let root = obj.root();
+        let ps = merkle_scan_pubdata::<MH, NH, NUM_SCANS_PER_FOLD>(cbs, Time::from(0));
+        let prs = dummy_scan_witness::<MH, NH>(cbs);
+        let md = <MerkleObjStore<F, OH> as PublicUserBul<F, MsgUser>>::get_membership_data(
+            obj,
+            self.commitment(),
+        )
+        .ok_or(MemberError::NotJoined)?;
+        let exec = self
+            .user
+            .interact::<H, PubScan<MerkleCallbackStore<F, MH, NH>, NUM_SCANS_PER_FOLD>, PubScanVar<MerkleCallbackStore<F, MH, NH>, NUM_SCANS_PER_FOLD>, PrivScan<MerkleCallbackStore<F, MH, NH>, NUM_SCANS_PER_FOLD>, PrivScanVar<MerkleCallbackStore<F, MH, NH>, NUM_SCANS_PER_FOLD>, Args, ArgsVar, Cr, Snark, MerkleObjStore<F, OH>, 0>(
+                rng,
+                get_dummy_scan_interaction::<MerkleCallbackStore<F, MH, NH>, NUM_SCANS_PER_FOLD>(),
+                [],
+                Time::from(0),
+                md,
+                false,
+                &self.keys.scan,
+                ps,
+                prs,
+                true,
+            )?;
+        Ok(Record::Scan {
+            exec: Ark(exec),
+            obj_root: Ark(root),
+            cb_memb_root: Ark(cbs.memb_root()),
+            cb_nmemb_root: Ark(cbs.nmemb_root()),
+        })
+    }
+
     /// The shared `pseudonym_pred` proof for a vote or a rating: prove membership and
     /// `claimed = H(sk, context)`, returning `(root, claimed, proof)`.
     /// Prove that TWO of this member's pseudonyms share an author, without revealing
@@ -632,10 +703,12 @@ impl Member {
             a: PseudonymArgs {
                 context: context_a,
                 claimed: claimed_a,
+                ..Default::default()
             },
             b: PseudonymArgs {
                 context: context_b,
                 claimed: claimed_b,
+                ..Default::default()
             },
         };
 
@@ -722,6 +795,7 @@ impl Member {
         rng: &mut (impl CryptoRng + RngCore),
         obj: &MerkleObjStore<F, OH>,
         context: F,
+        payload: F,
     ) -> Result<(F, F, <Snark as ark_snark::SNARK<F>>::Proof), MemberError> {
         let (root, path) =
             <MerkleObjStore<F, OH> as PublicUserBul<F, MsgUser>>::get_membership_data(
@@ -730,7 +804,11 @@ impl Member {
             )
             .ok_or(MemberError::NotJoined)?;
         let claimed = persona::pseudonym(&self.user.data.sk, &context);
-        let pseudo = PseudonymArgs { context, claimed };
+        let pseudo = PseudonymArgs {
+            context,
+            claimed,
+            payload,
+        };
         let proof = self
             .user
             .prove_statement_and_in::<H, PseudonymArgs<F>, PseudonymArgsVar<F>, (), (), Snark, MerkleObjStore<F, OH>>(
@@ -743,6 +821,32 @@ impl Member {
                 (),
             )?;
         Ok((root, claimed, proof))
+    }
+
+    /// Whether this member has used up its interactions between sweeps. Its next post could
+    /// not be proved, and sending one anyway would advance its object past what any replica
+    /// accepts.
+    pub fn scan_required(&self) -> bool {
+        use ark_ff::PrimeField;
+        let last = F::from((personas_core::circuits::NUM_INTS_BEFORE_SCAN - 1) as u64);
+        self.user
+            .data
+            .num_interactions_since_last_scan
+            .into_bigint()
+            >= last.into_bigint()
+    }
+
+    /// Refuse an interaction this member has no allowance for, and one that would panic
+    /// inside the library's check that no sweep is running.
+    fn require_allowance<const OH: usize>(
+        &self,
+        obj: &MerkleObjStore<F, OH>,
+    ) -> Result<(), MemberError> {
+        self.require_member(obj)?;
+        if self.scan_required() {
+            return Err(MemberError::ScanRequired);
+        }
+        Ok(())
     }
 
     /// Refuse a post/scan before it can panic inside `exec_method_create_cb`'s
@@ -760,6 +864,34 @@ impl Member {
             return Err(MemberError::NotJoined);
         }
         Ok(())
+    }
+}
+
+/// Whether `user`'s object is in `obj`.
+pub fn object_on_bulletin<const OH: usize>(
+    user: &User<F, MsgUser>,
+    obj: &MerkleObjStore<F, OH>,
+) -> bool {
+    <MerkleObjStore<F, OH> as PublicUserBul<F, MsgUser>>::get_membership_data(
+        obj,
+        user.commit::<H>(),
+    )
+    .is_some()
+}
+
+/// A witness for a dummy scan: any ticket will do, since a dummy scan's proof takes the
+/// branch of the predicate that ignores it.
+fn dummy_scan_witness<const MH: usize, const NH: usize>(
+    cbs: &MerkleCallbackStore<F, MH, NH>,
+) -> PrivScan<MerkleCallbackStore<F, MH, NH>, NUM_SCANS_PER_FOLD> {
+    let ticket = FakeSigPubkey::pk();
+    let (_, memb, _, nmemb) = PublicCallbackBul::<F, Args, Cr>::get_membership_data(cbs, ticket);
+    PrivScan {
+        priv_n_tickets: [Default::default()],
+        enc_args: [Default::default()],
+        post_times: [Default::default()],
+        memb_priv: [memb],
+        nmemb_priv: [nmemb],
     }
 }
 

@@ -15,7 +15,6 @@ use std::path::Path;
 
 use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
 use ark_grumpkin::{Fq, Fr};
-use ark_r1cs_std::fields::fp::FpVar;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
 use blake2::{Blake2s256, Digest};
 use folding_schemes::FoldingScheme;
@@ -39,7 +38,8 @@ use crate::circuits::{
     PseudonymArgsPair, PseudonymArgsPairVar, PseudonymArgsRate, PseudonymArgsVar, PubScan, ScanInt,
     authorship_pred, badge_pred, get_badge_request_interaction, get_callbacks,
     get_extra_pubdata_for_scan, get_scan_interaction, get_standard_interaction,
-    get_standard_pseudo_interaction, get_standard_pseudo_rate_interaction, join_pred,
+    JoinArgs, JoinArgsVar, ResetArgs, ResetArgsVar, get_standard_pseudo_interaction,
+    get_standard_pseudo_rate_interaction, join_pred,
     not_banned_pred, pseudonym_pred,
 };
 use crate::{Args, ArgsVar, CStore, Cr, F, H, OStore, PK, Snark, Store, VK};
@@ -231,10 +231,7 @@ pub fn generate_server_keys(rng: &mut (impl CryptoRng + RngCore), db: &Store) ->
         );
 
     let standard_pseudo_interaction = get_standard_pseudo_interaction();
-    let dummy_pub_std_pseudo = PseudonymArgs {
-        context: F::from(0),
-        claimed: F::from(0),
-    };
+    let dummy_pub_std_pseudo = PseudonymArgs::default();
     let (standard_pseudo_proving_key, standard_pseudo_verifying_key) = standard_pseudo_interaction
         .generate_keys::<H, Snark, Cr, OStore>(
         rng,
@@ -244,11 +241,7 @@ pub fn generate_server_keys(rng: &mut (impl CryptoRng + RngCore), db: &Store) ->
     );
 
     let standard_pseudo_rate_interaction = get_standard_pseudo_rate_interaction();
-    let dummy_pub_std_pseudo_rate = PseudonymArgsRate {
-        i: F::from(0),
-        context: F::from(0),
-        claimed: F::from(0),
-    };
+    let dummy_pub_std_pseudo_rate = PseudonymArgsRate::default();
     let (standard_pseudor_proving_key, standard_pseudor_verifying_key) =
         standard_pseudo_rate_interaction.generate_keys::<H, Snark, Cr, OStore>(
             rng,
@@ -348,18 +341,28 @@ pub fn generate_server_keys(rng: &mut (impl CryptoRng + RngCore), db: &Store) ->
     // A join proves its object is fresh: a statement about the object alone (no
     // membership — it is not in any tree yet), its commitment the first public input.
     let (join_pred_proving_key, join_pred_verifying_key) =
-        generate_keys_for_statement::<F, H, MsgUser, F, FpVar<F>, (), (), Snark>(
+        generate_keys_for_statement::<F, H, MsgUser, JoinArgs<F>, JoinArgsVar<F>, (), (), Snark>(
             rng,
             join_pred,
-            F::from(0u64),
+            JoinArgs::default(),
         );
     // A reset request proves a CURRENT object (membership) is unbanned and just swept.
     let (not_banned_pred_proving_key, not_banned_pred_verifying_key) =
-        generate_keys_for_statement_in::<F, H, MsgUser, F, FpVar<F>, (), (), Snark, OStore>(
+        generate_keys_for_statement_in::<
+            F,
+            H,
+            MsgUser,
+            ResetArgs<F>,
+            ResetArgsVar<F>,
+            (),
+            (),
+            Snark,
+            OStore,
+        >(
             rng,
             not_banned_pred,
             Some(db.obj_bul.get_pubkey()),
-            F::from(0u64),
+            ResetArgs::default(),
         );
 
     ServerKeys {

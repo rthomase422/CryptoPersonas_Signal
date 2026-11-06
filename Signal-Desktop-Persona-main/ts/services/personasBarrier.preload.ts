@@ -40,17 +40,25 @@ export function getBarrierSchedule(groupId: string | undefined): BarrierSchedule
     : undefined;
 }
 
-// The timestamp a RECEIVED record is placed by: the sender's own (the message's sent
-// timestamp, which the sender also placed its copy by — personasRegistry), unless it is
-// implausibly far from the server's receive time, in which case the server's. Every
-// recipient sees the same two values, so they all agree either way.
-// A sender picks its own `sent_at`, so this skew bounds how many barriers it can choose
-// between: at one barrier period, about three.
+// The timestamp a RECEIVED record is placed by. An anonymous record goes by the service
+// timestamp, which its sender cannot choose, so no member can place its own record on a
+// barrier of its choice. Every recipient of one multi-recipient send sees the same value.
+//
+// An attributable record (a join, a re-join approval, an admin ban) is not echoed to its
+// sender, so it goes by the sender's own sent timestamp, unless that is implausibly far
+// from the service's. Every recipient sees the same two values, so they agree either way.
+//
+// A sender's skew bounds how many barriers it can choose between: about three at a period
+// of 10 s.
 const MAX_SENT_AT_SKEW_MS = 10_000;
 export function recordTimestamp(
   sentAtMs: number | null | undefined,
-  serverTimestampMs: number | null | undefined
+  serverTimestampMs: number | null | undefined,
+  attributable: boolean
 ): number {
+  if (!attributable && serverTimestampMs != null && serverTimestampMs > 0) {
+    return serverTimestampMs;
+  }
   if (sentAtMs != null && sentAtMs > 0) {
     if (
       serverTimestampMs == null ||

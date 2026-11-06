@@ -836,8 +836,17 @@ function renderToast({
     return (
       <Toast onClose={hideToast}>
         {'Members of this group are not all seeing the same persona messages. ' +
-          'Signal may have delayed or withheld some. Your app is re-sending the ' +
-          'messages it has to the group.'}
+          'Signal may have delayed or withheld some.'}
+      </Toast>
+    );
+  }
+
+  if (toastType === ToastType.PersonaRecordLost) {
+    // Stays until dismissed: the member's post may still show on their own screen.
+    return (
+      <Toast onClose={hideToast}>
+        {'Your last persona action did not reach the group. It arrived too late to ' +
+          'count, so please send it again.'}
       </Toast>
     );
   }

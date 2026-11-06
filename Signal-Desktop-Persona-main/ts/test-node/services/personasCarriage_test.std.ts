@@ -57,8 +57,8 @@ import {
   encodeBadgeProof,
   decodeBadgeProof,
   PERSONAS_AUTHORSHIP_MARKER,
-  decodePostBadge,
-  decodePostContextName,
+  decodePostText,
+  encodePostText,
   PERSONAS_PHANTOM_BUNDLE_MARKER,
   encodePhantomBundle,
   decodePhantomBundle,
@@ -248,84 +248,29 @@ describe('personasCarriage', () => {
   });
 });
 
-describe('post badge claims', () => {
-  const record = Buffer.from([0xde, 0xad, 0xbe, 0xef, 0x00, 0x7b, 0x22]);
-
-  it('encodes a plain post exactly as before badges existed', () => {
-    // Backward compatibility is the whole point of the two-shape design: an instance
-    // that never sets a badge must produce byte-identical bodies to the old build.
-    assert.strictEqual(
-      encodePostBody(record),
-      `PZP2:${record.toString('base64')}`
-    );
+describe('post text', () => {
+  it('leaves a post with no labels as plain text', () => {
+    assert.strictEqual(encodePostText({ text: 'hello' }), 'hello');
+    assert.deepStrictEqual(decodePostText('hello'), { text: 'hello' });
   });
 
-  it('round-trips the record through a badged post', () => {
-    const body = encodePostBody(record, 'Faculty');
-    assert.deepStrictEqual(decodeRecordBody(body), record);
-    assert.strictEqual(decodePostBadge(body), 'Faculty');
+  it('round-trips a badge and context name', () => {
+    const post = { text: 'hello', badge: 'Faculty', contextName: 'General' };
+    assert.deepStrictEqual(decodePostText(encodePostText(post)), post);
   });
 
-  it('round-trips the record through a plain post', () => {
-    const body = encodePostBody(record);
-    assert.deepStrictEqual(decodeRecordBody(body), record);
-    assert.strictEqual(decodePostBadge(body), undefined);
+  it('round-trips text that looks like a label block', () => {
+    const post = { text: '\u0000{"b":"Faculty"}\u0000hi' };
+    assert.deepStrictEqual(decodePostText(encodePostText(post)), post);
   });
 
-  it('still routes a badged post over the phantom identity', () => {
-    // A badge must not change the anonymity routing: a badged post is still a post.
-    assert.ok(isPersonaPhantomBody(encodePostBody(record, 'Student')));
-  });
-
-  it('treats a malformed envelope as a plain post rather than throwing', () => {
-    const body = `PZP2:${Buffer.from('{"nope":1}', 'utf8').toString('base64')}`;
-    assert.strictEqual(decodePostBadge(body), undefined);
-    assert.doesNotThrow(() => decodeRecordBody(body));
-  });
-
-  it('ignores a non-string badge from a hostile peer', () => {
-    const envelope = JSON.stringify({ r: record.toString('base64'), b: 42 });
-    const body = `PZP2:${Buffer.from(envelope, 'utf8').toString('base64')}`;
-    assert.strictEqual(decodePostBadge(body), undefined);
-    assert.deepStrictEqual(decodeRecordBody(body), record);
+  it('treats a malformed label block as text', () => {
+    assert.deepStrictEqual(decodePostText('\u0000not json\u0000hi'), {
+      text: '\u0000not json\u0000hi',
+    });
   });
 });
 
-describe('post context names', () => {
-  const record = Buffer.from([0xde, 0xad, 0xbe, 0xef, 0x7b, 0x22, 0x00]);
-
-  it('keeps a plain post byte-identical to the pre-context format', () => {
-    assert.strictEqual(
-      encodePostBody(record),
-      `PZP2:${record.toString('base64')}`
-    );
-  });
-
-  it('round-trips a context-only post', () => {
-    const body = encodePostBody(record, undefined, 'Union');
-    assert.deepStrictEqual(decodeRecordBody(body), record);
-    assert.strictEqual(decodePostContextName(body), 'Union');
-    assert.strictEqual(decodePostBadge(body), undefined);
-  });
-
-  it('round-trips a badge AND a context together', () => {
-    const body = encodePostBody(record, 'Faculty', 'Union');
-    assert.deepStrictEqual(decodeRecordBody(body), record);
-    assert.strictEqual(decodePostBadge(body), 'Faculty');
-    assert.strictEqual(decodePostContextName(body), 'Union');
-  });
-
-  it('ignores a non-string context from a hostile peer', () => {
-    const envelope = JSON.stringify({ r: record.toString('base64'), c: 42 });
-    const body = `PZP2:${Buffer.from(envelope, 'utf8').toString('base64')}`;
-    assert.strictEqual(decodePostContextName(body), undefined);
-    assert.deepStrictEqual(decodeRecordBody(body), record);
-  });
-
-  it('still routes a context-labelled post over the phantom', () => {
-    assert.ok(isPersonaPhantomBody(encodePostBody(record, undefined, 'Union')));
-  });
-});
 
 describe('authorship proof carriage', () => {
   const PROOF = Buffer.from([0, 1, 2, 250, 251, 252, 253, 254, 255]);

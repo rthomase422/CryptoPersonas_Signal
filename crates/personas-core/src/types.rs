@@ -222,10 +222,10 @@ pub fn verify_badge_proof(vk: &impl crate::ProofVerifier, bytes: &[u8]) -> Optio
     }
 }
 
-/// Serialize a not-banned (reset request) proof and its public inputs `[account, root]`.
+/// Serialize a not-banned (reset request) proof and its public inputs `[account, nul, root]`.
 pub fn encode_not_banned_proof(
     proof: &<Snark as ark_snark::SNARK<F>>::Proof,
-    inputs: &[F; 2],
+    inputs: &[F; 3],
 ) -> Result<Vec<u8>, ark_serialize::SerializationError> {
     use ark_serialize::CanonicalSerialize;
 
@@ -235,10 +235,27 @@ pub fn encode_not_banned_proof(
     Ok(bytes)
 }
 
-/// VERIFY a not-banned proof, returning `(account, root)` only if it is sound. As with a
+/// Read a not-banned proof's bytes, returning the proof and `[account, nul, root]`.
+pub fn decode_not_banned_proof(
+    mut bytes: &[u8],
+) -> Option<(<Snark as ark_snark::SNARK<F>>::Proof, [F; 3])> {
+    use ark_serialize::CanonicalDeserialize;
+    use ark_snark::SNARK;
+
+    let proof =
+        <<Snark as SNARK<F>>::Proof as CanonicalDeserialize>::deserialize_uncompressed(&mut bytes)
+            .ok()?;
+    let inputs = Vec::<F>::deserialize_uncompressed(&mut bytes).ok()?;
+    Some((proof, inputs.try_into().ok()?))
+}
+
+/// VERIFY a not-banned proof, returning `(account, nul, root)` only if it is sound. As with a
 /// badge proof, the caller MUST check the root is one its replica produced, and that the
 /// account is the one asking.
-pub fn verify_not_banned_proof(vk: &impl crate::ProofVerifier, bytes: &[u8]) -> Option<(F, F)> {
+pub fn verify_not_banned_proof(
+    vk: &impl crate::ProofVerifier,
+    bytes: &[u8],
+) -> Option<(F, F, F)> {
     use ark_serialize::CanonicalDeserialize;
     use ark_snark::SNARK;
 
@@ -247,11 +264,11 @@ pub fn verify_not_banned_proof(vk: &impl crate::ProofVerifier, bytes: &[u8]) -> 
         <<Snark as SNARK<F>>::Proof as CanonicalDeserialize>::deserialize_uncompressed(&mut reader)
             .ok()?;
     let inputs = Vec::<F>::deserialize_uncompressed(&mut reader).ok()?;
-    if inputs.len() != 2 {
+    if inputs.len() != 3 {
         return None;
     }
     if vk.verify_proof(&inputs, &proof) {
-        Some((inputs[0], inputs[1]))
+        Some((inputs[0], inputs[1], inputs[2]))
     } else {
         None
     }

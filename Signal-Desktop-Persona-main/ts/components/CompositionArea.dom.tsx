@@ -1497,7 +1497,7 @@ export const CompositionArea = memo(function CompositionArea({
       </div>
     );
 
-  // Creating a topic draws a random context and announces it to the group, so every
+  // Creating a topic announces it to the group, so every
   // member binds the same context for this topic name.
   const handleCreateTopic = useCallback(() => {
     const name = newTopicName.trim();

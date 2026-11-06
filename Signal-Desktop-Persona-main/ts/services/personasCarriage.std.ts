@@ -33,7 +33,7 @@
 //     anti-Sybil / ban-evasion guarantee depends on one membership per real account,
 //     which an anonymous join would defeat.
 //   - TOPIC ANNOUNCEMENTS (`PZT2:`) are not ZK records at all — coordination metadata
-//     mapping a topic name to its random context. The engine never sees them.
+//     mapping a topic name to its context. The engine never sees them.
 // The record-bearing markers all yield the same CBOR bytes on decode (the engine
 // classifies kind); the marker steers SEND-side routing and carries display metadata.
 
@@ -65,9 +65,10 @@ export const PERSONAS_TOPIC_MARKER = 'PZT2:';
 // personasAuthorship.preload.ts.)
 export const PERSONAS_AUTHORSHIP_MARKER = 'PZU2:';
 
-// A BADGE REQUEST or APPROVAL. Its own marker, distinct from the attributable PZR2, for
-// one reason: these ride the SHARED PHANTOM, so the requester and the approver are both
-// unlinkable on the wire.
+// A BADGE REQUEST. Its own marker, distinct from the attributable PZR2, for one reason:
+// it rides the SHARED PHANTOM, so the requester is unlinkable on the wire. An APPROVAL
+// goes under the admin's own account instead (PZR2): an approval only means something
+// coming from an admin, and every member checks that (recordSenderProblem).
 //
 // That is a change of mind, and the reasoning matters. These started out attributable on
 // the theory that "a request asks a human to vouch for you, which cannot be done
@@ -143,7 +144,7 @@ export type PersonaChoice =
   | { kind: 'pseudo'; nonce: number }
   // One of the RATE-LIMITED personas, which ARE topic-scoped:
   //   persona = H(sk || context || index),  index < MAX_PSEUDO
-  // `context` is the topic's random context number (see personasTopics), so the same
+  // `context` is the topic's context number (see personasTopics), so the same
   // member has unlinkable petnames across topics, and at most MAX_PSEUDO identities
   // within any one topic.
   | { kind: 'rate'; context: number; index: number }
@@ -177,94 +178,55 @@ export function encodeBadgeBody(bytes: Buffer | Uint8Array): string {
   return PERSONAS_BADGE_MARKER + Buffer.from(bytes).toString('base64');
 }
 
-// Wrap a POST record — the one kind that rides the shared phantom identity.
-//
-// Two shapes behind the same marker, and the plain one is unchanged from before badges
-// existed so old and new bodies interoperate:
-//
-//   PZP2:<base64 record>                     — no badge claim (the common case)
-//   PZP2:<base64 {"r":"<record>","b":"..."}> — with a badge claim
-//
-// The badge is DISPLAY METADATA, exactly like a poll's option labels: untrusted, not
-// part of the proof, and not checked by anything. See personasBadges.std.ts — a peer can
-// claim any badge it likes. It is carried here rather than in the record because the
-// record is the engine's and the engine has no notion of badges in the serverless model.
-export function encodePostBody(
-  bytes: Buffer | Uint8Array,
-  badge?: string,
-  contextName?: string
-): string {
-  const record = Buffer.from(bytes).toString('base64');
-  if (!badge && !contextName) {
-    return PERSONAS_POST_MARKER + record;
+// Wrap a POST record — the one kind that rides the shared phantom identity. Everything
+// about the post is inside the record, so nothing rides beside it.
+export function encodePostBody(bytes: Buffer | Uint8Array): string {
+  return PERSONAS_POST_MARKER + Buffer.from(bytes).toString('base64');
+}
+
+// What a post says, as its proof covers it: the text, plus the badge and context name
+// shown with it. They go in the record's text so a relaying member cannot change them. The
+// badge is still only the author's claim, and a context name is still the author's label
+// for the context number in the proof; what this adds is that nobody else can alter them.
+export type PersonaPostText = {
+  text: string;
+  badge?: string;
+  contextName?: string;
+};
+
+const POST_LABEL_DELIMITER = '\u0000';
+
+export function encodePostText({
+  text,
+  badge,
+  contextName,
+}: PersonaPostText): string {
+  if (!badge && !contextName && !text.startsWith(POST_LABEL_DELIMITER)) {
+    return text;
   }
-  // `c` is the CONTEXT NAME, display metadata exactly like the badge and a poll's option
-  // labels. The record already carries the context NUMBER in its public inputs, so the
-  // number is authoritative and provable; the human-readable name is not, and a peer
-  // could mislabel its own post's context. That is a display-integrity limit, not a
-  // soundness one — the rate-limit still binds to the number inside the proof.
-  //
-  // Carried rather than resolved locally because a recipient may not have heard the
-  // context announcement (PZT2) yet, and a post that renders with no context at all is
-  // worse than one that renders with an unverified name.
-  const envelope = { r: record, b: badge, c: contextName };
+  const labels = JSON.stringify({ b: badge, c: contextName });
   return (
-    PERSONAS_POST_MARKER +
-    Buffer.from(JSON.stringify(envelope), 'utf8').toString('base64')
+    POST_LABEL_DELIMITER + labels + POST_LABEL_DELIMITER + text
   );
 }
 
-// The badge claim carried by a PZP2 body, if any. Undefined for a plain post, for a
-// non-post, and for anything malformed — a badge is never worth failing a message over.
-export function decodePostBadge(
-  body: string | undefined | null
-): string | undefined {
-  if (!body?.startsWith(PERSONAS_POST_MARKER)) {
-    return undefined;
+export function decodePostText(body: string): PersonaPostText {
+  if (!body.startsWith(POST_LABEL_DELIMITER)) {
+    return { text: body };
   }
-  const envelope = parsePostEnvelope(body);
-  return typeof envelope?.b === 'string' ? envelope.b : undefined;
-}
-
-// The context NAME a post was made under, if it carried one. Undefined for an anonymous
-// or context-free pseudonymous post. Untrusted — see encodePostBody.
-export function decodePostContextName(
-  body: string | undefined | null
-): string | undefined {
-  if (!body?.startsWith(PERSONAS_POST_MARKER)) {
-    return undefined;
+  const end = body.indexOf(POST_LABEL_DELIMITER, 1);
+  if (end < 0) {
+    return { text: body };
   }
-  const envelope = parsePostEnvelope(body);
-  return typeof envelope?.c === 'string' ? envelope.c : undefined;
-}
-
-// A post body is an envelope only if its base64 decodes to JSON with an `r` field.
-// A plain post's payload is raw record bytes, which will not parse as JSON — so this
-// distinguishes the two shapes without a second marker and without a version bump.
-function parsePostEnvelope(
-  body: string
-): { r: string; b?: string; c?: string } | undefined {
   try {
-    const json = Buffer.from(
-      body.slice(PERSONAS_POST_MARKER.length),
-      'base64'
-    ).toString('utf8');
-    const parsed = JSON.parse(json) as {
-      r?: unknown;
-      b?: unknown;
-      c?: unknown;
-    };
-    if (typeof parsed?.r !== 'string') {
-      return undefined;
-    }
+    const labels = JSON.parse(body.slice(1, end)) as { b?: unknown; c?: unknown };
     return {
-      r: parsed.r,
-      b: typeof parsed.b === 'string' ? parsed.b : undefined,
-      c: typeof parsed.c === 'string' ? parsed.c : undefined,
+      text: body.slice(end + 1),
+      ...(typeof labels?.b === 'string' ? { badge: labels.b } : {}),
+      ...(typeof labels?.c === 'string' ? { contextName: labels.c } : {}),
     };
   } catch {
-    // Not JSON: a plain post. Expected, not exceptional.
-    return undefined;
+    return { text: body };
   }
 }
 
@@ -336,17 +298,6 @@ export function decodeRecordBody(
     return undefined;
   }
   try {
-    if (marker === PERSONAS_POST_MARKER) {
-      // A post is EITHER raw record bytes or a {r, b} envelope (see encodePostBody).
-      // Unwrap when it is an envelope; otherwise fall through to the plain path. Getting
-      // this wrong would hand the engine JSON instead of a record, so every badged post
-      // would be rejected — which is why the envelope shape is detected by parse success
-      // rather than assumed.
-      const envelope = parsePostEnvelope(body);
-      if (envelope) {
-        return Buffer.from(envelope.r, 'base64');
-      }
-    }
     return Buffer.from(body.slice(marker.length), 'base64');
   } catch {
     return undefined;

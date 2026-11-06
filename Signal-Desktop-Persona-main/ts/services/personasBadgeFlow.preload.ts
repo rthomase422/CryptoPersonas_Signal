@@ -44,7 +44,10 @@ import type { ConversationModel } from '../models/conversations.preload.ts';
 
 import { createLogger } from '../logging/log.std.ts';
 import { toLogFormat } from '../types/errors.std.ts';
-import { ensureReadyForPersonaAction } from './personasActions.preload.ts';
+import {
+  ensureReadyForPersonaAction,
+  ensureReadyForUnprovenRecord,
+} from './personasActions.preload.ts';
 import {
   BADGE_SLOTS,
   composeBadgeApprove,
@@ -199,7 +202,7 @@ export async function approveBadge(
     // The approving ADMIN has to be on the bulletin too — an approval is a record like
     // any other. An admin who had not posted yet could not approve anything, which is
     // the same missing join seen from the other side.
-    if (!(await ensureReadyForPersonaAction(conversation))) {
+    if (!(await ensureReadyForUnprovenRecord(conversation))) {
       log.warn('approveBadge: could not join; refusing to approve');
       return {
         ok: false,
@@ -219,7 +222,6 @@ export async function approveBadge(
       body: undefined,
       attachments: [],
       personaCarriageBody: approval.body,
-      personaAnonymous: true,
       // `approval.eh`, not `requestEh`: the notice identifies THIS record. The request's
       // own notification is what stops showing an Approve button, and it does so because
       // `pendingBadgeRequests()` no longer lists it — not because of anything stored here.

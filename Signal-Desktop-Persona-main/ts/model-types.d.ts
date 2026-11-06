@@ -223,6 +223,8 @@ export type MessageAttributesType = {
   // On a poll record, the display descriptor (question / option labels / ban-vs-
   // standard) needed to draw the bubble. The engine remains authoritative for the
   // tally and for settlement; see PersonaPollDescriptor.
+  // The poll's last tally line, so a new ballot redraws the bubble.
+  personaPollStatus?: string;
   personaPoll?: {
     question: string;
     options: ReadonlyArray<string>;

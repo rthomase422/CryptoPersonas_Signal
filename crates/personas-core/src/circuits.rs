@@ -39,7 +39,9 @@ use lazy_static::lazy_static;
 
 use crate::{Args, ArgsVar, CStore, Cr, H, OStore, PK, Snark};
 
-pub const NUM_INTS_BEFORE_SCAN: usize = 200;
+/// How many interactions a member can make between finished sweeps. This bounds how long a
+/// banned member who refuses to scan can keep posting.
+pub const NUM_INTS_BEFORE_SCAN: usize = 20;
 /// How many rate-limited personas a member has in each context: persona `i` of context
 /// `c` is `H(sk, c, i)` for `i` in `0..MAX_PSEUDO`, so every context has its own three,
 /// unlinkable to any other context's.
@@ -170,18 +172,23 @@ pub struct FoldingProofData {
 pub struct PseudonymArgs<F: PrimeField> {
     pub context: F,
     pub claimed: F,
+    /// What the proof is about: a hash of the post text, ballot or rating it travels with.
+    pub payload: F,
 }
 
 #[derive(Clone)]
 pub struct PseudonymArgsVar<F: PrimeField> {
     pub context: FpVar<F>,
     pub claimed: FpVar<F>,
+    pub payload: FpVar<F>,
 }
 #[derive(Clone, Debug, Default, CanonicalDeserialize, CanonicalSerialize)]
 pub struct PseudonymArgsRate<F: PrimeField> {
     pub context: F,
     pub claimed: F,
     pub i: F,
+    /// See [`PseudonymArgs::payload`].
+    pub payload: F,
 }
 
 #[derive(Clone)]
@@ -189,6 +196,7 @@ pub struct PseudonymArgsRateVar<F: PrimeField> {
     pub context: FpVar<F>,
     pub claimed: FpVar<F>,
     pub i: FpVar<F>,
+    pub payload: FpVar<F>,
 }
 
 #[derive(Clone, Debug, Default, CanonicalDeserialize, CanonicalSerialize)]
@@ -224,17 +232,22 @@ impl<F: PrimeField> AllocVar<PseudonymArgs<F>, F> for PseudonymArgsVar<F> {
         let ns = cs.into();
         let cs = ns.cs(); // ConstraintSystemRef<F>
 
-        let PseudonymArgs { context, claimed } = *f()?.borrow();
+        let PseudonymArgs {
+            context,
+            claimed,
+            payload,
+        } = *f()?.borrow();
         Ok(Self {
             context: FpVar::new_variable(cs.clone(), || Ok(context), mode)?,
-            claimed: FpVar::new_variable(cs, || Ok(claimed), mode)?,
+            claimed: FpVar::new_variable(cs.clone(), || Ok(claimed), mode)?,
+            payload: FpVar::new_variable(cs, || Ok(payload), mode)?,
         })
     }
 }
 
 impl<F: PrimeField> ToConstraintField<F> for PseudonymArgs<F> {
     fn to_field_elements(&self) -> Option<Vec<F>> {
-        Some(vec![self.context, self.claimed])
+        Some(vec![self.context, self.claimed, self.payload])
     }
 }
 
@@ -244,6 +257,7 @@ pub fn pseudonym_pred(
     pub_args: PseudonymArgsVar<F>,
     _priv_args: (),
 ) -> ArkResult<Boolean<F>> {
+    bind_public_input(&pub_args.payload)?;
     let context = pub_args.context;
     let claimed = pub_args.claimed;
     let derived = Poseidon::<2>::hash_in_zk(&[tu.data.sk.clone(), context.clone()])?;
@@ -263,18 +277,20 @@ impl<F: PrimeField> AllocVar<PseudonymArgsRate<F>, F> for PseudonymArgsRateVar<F
             context,
             claimed,
             i,
+            payload,
         } = *f()?.borrow();
         Ok(Self {
             context: FpVar::new_variable(cs.clone(), || Ok(context), mode)?,
             claimed: FpVar::new_variable(cs.clone(), || Ok(claimed), mode)?,
-            i: FpVar::new_variable(cs, || Ok(i), mode)?,
+            i: FpVar::new_variable(cs.clone(), || Ok(i), mode)?,
+            payload: FpVar::new_variable(cs, || Ok(payload), mode)?,
         })
     }
 }
 
 impl<F: PrimeField> ToConstraintField<F> for PseudonymArgsRate<F> {
     fn to_field_elements(&self) -> Option<Vec<F>> {
-        Some(vec![self.context, self.claimed, self.i])
+        Some(vec![self.context, self.claimed, self.i, self.payload])
     }
 }
 
@@ -354,14 +370,17 @@ impl<F: PrimeField> AllocVar<PseudonymArgsPair<F>, F> for PseudonymArgsPairVar<F
         let pair = f()?;
         let pair = pair.borrow();
 
+        // An authorship proof is about the pseudonyms alone, so it carries no payload.
         let a_var = PseudonymArgsVar {
             context: FpVar::new_variable(cs.clone(), || Ok(pair.a.context), mode)?,
             claimed: FpVar::new_variable(cs.clone(), || Ok(pair.a.claimed), mode)?,
+            payload: FpVar::Constant(F::ZERO),
         };
 
         let b_var = PseudonymArgsVar {
             context: FpVar::new_variable(cs.clone(), || Ok(pair.b.context), mode)?,
             claimed: FpVar::new_variable(cs, || Ok(pair.b.claimed), mode)?,
+            payload: FpVar::Constant(F::ZERO),
         };
 
         Ok(Self { a: a_var, b: b_var })
@@ -397,6 +416,85 @@ fn bind_public_input(value: &FpVar<F>) -> ArkResult<()> {
     Ok(())
 }
 
+/// A member's public key: a hash of `sk` that identifies the member across objects. It is
+/// three-input with a domain tag so it cannot equal any pseudonym, which hash `(sk, context)`
+/// or `(sk, context, i)` with `i` below [`MAX_PSEUDO`].
+pub fn member_pk_tag() -> F {
+    string_hash_to_f::<F>("personas member public key")
+}
+
+/// What a join proves it is for, both public inputs: the joining ACCOUNT and the member's
+/// public key.
+#[derive(Clone, Debug, Default, CanonicalDeserialize, CanonicalSerialize)]
+pub struct JoinArgs<F: PrimeField> {
+    pub account: F,
+    pub pk: F,
+}
+
+#[derive(Clone)]
+pub struct JoinArgsVar<F: PrimeField> {
+    pub account: FpVar<F>,
+    pub pk: FpVar<F>,
+}
+
+impl<F: PrimeField> AllocVar<JoinArgs<F>, F> for JoinArgsVar<F> {
+    fn new_variable<T: Borrow<JoinArgs<F>>>(
+        cs: impl Into<Namespace<F>>,
+        f: impl FnOnce() -> Result<T, SynthesisError>,
+        mode: AllocationMode,
+    ) -> Result<Self, SynthesisError> {
+        let ns = cs.into();
+        let cs = ns.cs();
+        let JoinArgs { account, pk } = *f()?.borrow();
+        Ok(Self {
+            account: FpVar::new_variable(cs.clone(), || Ok(account), mode)?,
+            pk: FpVar::new_variable(cs, || Ok(pk), mode)?,
+        })
+    }
+}
+
+impl<F: PrimeField> ToConstraintField<F> for JoinArgs<F> {
+    fn to_field_elements(&self) -> Option<Vec<F>> {
+        Some(vec![self.account, self.pk])
+    }
+}
+
+/// What a reset request proves it is for, both public inputs: the requesting ACCOUNT and
+/// the nullifier of the object it gives up.
+#[derive(Clone, Debug, Default, CanonicalDeserialize, CanonicalSerialize)]
+pub struct ResetArgs<F: PrimeField> {
+    pub account: F,
+    pub nul: F,
+}
+
+#[derive(Clone)]
+pub struct ResetArgsVar<F: PrimeField> {
+    pub account: FpVar<F>,
+    pub nul: FpVar<F>,
+}
+
+impl<F: PrimeField> AllocVar<ResetArgs<F>, F> for ResetArgsVar<F> {
+    fn new_variable<T: Borrow<ResetArgs<F>>>(
+        cs: impl Into<Namespace<F>>,
+        f: impl FnOnce() -> Result<T, SynthesisError>,
+        mode: AllocationMode,
+    ) -> Result<Self, SynthesisError> {
+        let ns = cs.into();
+        let cs = ns.cs();
+        let ResetArgs { account, nul } = *f()?.borrow();
+        Ok(Self {
+            account: FpVar::new_variable(cs.clone(), || Ok(account), mode)?,
+            nul: FpVar::new_variable(cs, || Ok(nul), mode)?,
+        })
+    }
+}
+
+impl<F: PrimeField> ToConstraintField<F> for ResetArgs<F> {
+    fn to_field_elements(&self) -> Option<Vec<F>> {
+        Some(vec![self.account, self.nul])
+    }
+}
+
 /// JOIN: the committed object is FRESH. Proved by every joining member, checked by every
 /// replica before the object is added to the tree.
 ///
@@ -409,21 +507,25 @@ fn bind_public_input(value: &FpVar<F>) -> ArkResult<()> {
 ///
 /// `com` is the proof's first public input and IS the join's object: the predicate
 /// recomputes the commitment of the witnessed object and requires equality, so the
-/// proof is about exactly the leaf being added. `pub_args` is the joining ACCOUNT (a
+/// proof is about exactly the leaf being added. `pub_args` carries the joining ACCOUNT (a
 /// field element of the account's ACI), bound so the proof cannot be replayed as
-/// another account's join.
+/// another account's join, and the member's public key, which replicas hold unique per
+/// account so two accounts cannot share one `sk`.
 pub fn join_pred(
     tu: &UserVar<F, MsgUser>,
     com: &FpVar<F>,
-    account: FpVar<F>,
+    pub_args: JoinArgsVar<F>,
     _priv_args: (),
 ) -> ArkResult<Boolean<F>> {
-    bind_public_input(&account)?;
+    bind_public_input(&pub_args.account)?;
+    let tag = FpVar::Constant(member_pk_tag());
+    let pk = Poseidon::<2>::hash_in_zk(&[tu.data.sk.clone(), tag.clone(), tag])?;
     let zero = FpVar::Constant(F::from(0u64));
     let committed = User::<F, MsgUser>::commit_in_zk::<Poseidon<2>>(tu.clone())?;
 
     let checks = [
         committed.is_eq(com)?,
+        pk.is_eq(&pub_args.pk)?,
         tu.data.reputation.is_eq(&zero)?,
         tu.data.num_interactions_since_last_scan.is_eq(&zero)?,
         tu.data.pseudo_counter.is_eq(&zero)?,
@@ -447,17 +549,20 @@ pub fn join_pred(
 /// object must ALSO be the result of a completed scan sweep with nothing since —
 /// `num_interactions_since_last_scan == 0` (a scan zeroes it, every other interaction
 /// increments it) and `is_ingest_over` (true only once a sweep has visited every
-/// callback). Every ban settled before that sweep was therefore absorbed. `pub_args` is
-/// the requesting ACCOUNT, bound so the proof cannot be presented by another account.
+/// callback). Every ban settled before that sweep was therefore absorbed. `pub_args` has
+/// the requesting ACCOUNT, bound so the proof cannot be presented by another account, and
+/// this object's nullifier, which approving the reset spends: a member who rejoins must
+/// not keep the old object as a second one that a ban would miss.
 pub fn not_banned_pred(
     tu: &UserVar<F, MsgUser>,
     _com: &FpVar<F>,
-    account: FpVar<F>,
+    pub_args: ResetArgsVar<F>,
     _priv_args: (),
 ) -> ArkResult<Boolean<F>> {
-    bind_public_input(&account)?;
+    bind_public_input(&pub_args.account)?;
     let zero = FpVar::Constant(F::from(0u64));
     let checks = [
+        tu.zk_fields.nul.is_eq(&pub_args.nul)?,
         tu.data.banned.is_eq(&zero)?,
         tu.data.num_interactions_since_last_scan.is_eq(&zero)?,
         tu.zk_fields.is_ingest_over.clone(),
@@ -504,9 +609,11 @@ fn standard_badge_request_method(
 fn standard_predicate<'a>(
     tu_old: &'a UserVar<F, MsgUser>,
     tu_new: &'a UserVar<F, MsgUser>,
-    _args: FpVar<F>,
+    args: FpVar<F>,
     _priv: (),
 ) -> ArkResult<Boolean<F>> {
+    // `args` is the post's payload hash.
+    bind_public_input(&args)?;
     let x1 = tu_new.data.num_interactions_since_last_scan.is_eq(
         &(tu_old.data.num_interactions_since_last_scan.clone() + FpVar::Constant(F::from(1))),
     )?;
@@ -524,7 +631,11 @@ fn standard_predicate<'a>(
     let x7 = tu_new.data.badge2.is_eq(&tu_old.data.badge2)?;
     let x8 = tu_new.data.badge3.is_eq(&tu_old.data.badge3)?;
 
-    Ok(x1 & x2 & x3 & x4 & x5 & x6 & x7 & x8)
+    // A post cannot go out in the middle of a sweep, or a member could interleave one scan
+    // with posts and never finish it.
+    let x9 = tu_old.zk_fields.is_ingest_over.clone();
+
+    Ok(x1 & x2 & x3 & x4 & x5 & x6 & x7 & x8 & x9)
 }
 
 fn standard_pseudo_predicate<'a>(
@@ -551,12 +662,14 @@ fn standard_pseudo_predicate<'a>(
     let x8 = tu_new.data.badge3.is_eq(&tu_old.data.badge3)?;
 
     // Pseudonym check
+    bind_public_input(&pub_args.payload)?;
     let context = pub_args.context;
     let claimed = pub_args.claimed;
     let derived = Poseidon::<2>::hash_in_zk(&[tu_new.data.sk.clone(), context.clone()])?;
     let x9 = derived.is_eq(&claimed)?;
+    let x10 = tu_old.zk_fields.is_ingest_over.clone();
 
-    Ok(x1 & x2 & x3 & x4 & x5 & x6 & x7 & x8 & x9)
+    Ok(x1 & x2 & x3 & x4 & x5 & x6 & x7 & x8 & x9 & x10)
 }
 
 fn standard_pseudo_rate_predicate<'a>(
@@ -583,6 +696,7 @@ fn standard_pseudo_rate_predicate<'a>(
     let x8 = tu_new.data.badge3.is_eq(&tu_old.data.badge3)?;
 
     // Pseudonym check
+    bind_public_input(&pub_args.payload)?;
     let context = pub_args.context;
     let claimed = pub_args.claimed;
     let i = pub_args.i;
@@ -599,8 +713,9 @@ fn standard_pseudo_rate_predicate<'a>(
 
     let derived = Poseidon::<2>::hash_in_zk(&[tu_new.data.sk.clone(), context, i])?;
     let x10 = derived.is_eq(&claimed)?;
+    let x11 = tu_old.zk_fields.is_ingest_over.clone();
 
-    Ok(x1 & x2 & x3 & x4 & x5 & x6 & x7 & x8 & x9 & x10)
+    Ok(x1 & x2 & x3 & x4 & x5 & x6 & x7 & x8 & x9 & x10 & x11)
 }
 
 fn standard_badge_request_predicate<'a>(
@@ -672,6 +787,7 @@ fn standard_badge_request_predicate<'a>(
         & x7
         & x8
         & x9
+        & tu_old.zk_fields.is_ingest_over.clone()
         & faculty_request_ok
         & student_request_ok
         & industry_request_ok;
@@ -778,8 +894,23 @@ fn scan_method<CBul: PublicCallbackBul<F, Args, Cr> + Clone, const N: usize>(
     let interaction =
         scan::get_scan_interaction::<F, MsgUser, Args, ArgsVar, Cr, CBul, Poseidon<2>, N>();
     let mut out_user = (interaction.meth.0)(tu, pub_args, priv_args);
-    out_user.data.num_interactions_since_last_scan = F::ZERO;
+    // Only a FINISHED sweep resets the count: one scan of a long sweep must not buy another
+    // full allowance of posts.
+    if out_user.zk_fields.is_ingest_over {
+        out_user.data.num_interactions_since_last_scan = F::ZERO;
+    }
     out_user
+}
+
+/// A scan that changes nothing, which `scan_predicate` also accepts. Every member sends
+/// the same number of scans per epoch, and these fill the count, so the number of scans
+/// says nothing about a member's tickets.
+fn dummy_scan_method<CBul: PublicCallbackBul<F, Args, Cr> + Clone, const N: usize>(
+    tu: &User<F, MsgUser>,
+    _pub_args: PubScan<CBul, N>,
+    _priv_args: PrivScan<CBul, N>,
+) -> User<F, MsgUser> {
+    tu.clone()
 }
 
 fn scan_predicate<CBul: PublicCallbackBul<F, Args, Cr> + Clone, const N: usize>(
@@ -792,14 +923,36 @@ fn scan_predicate<CBul: PublicCallbackBul<F, Args, Cr> + Clone, const N: usize>(
     let mut user_new_prime = user_new.clone();
     user_new_prime.data.num_interactions_since_last_scan =
         user_old.data.num_interactions_since_last_scan.clone();
-    let x = (interaction.meth.1)(user_old, &user_new_prime, pub_args, priv_args);
-    x.map(|a| {
-        a & user_new
-            .data
-            .num_interactions_since_last_scan
-            .is_eq(&FpVar::zero())
-            .unwrap()
-    })
+    let real = (interaction.meth.1)(user_old, &user_new_prime, pub_args, priv_args)?;
+    let count = FpVar::conditionally_select(
+        &user_new.zk_fields.is_ingest_over,
+        &FpVar::zero(),
+        &user_old.data.num_interactions_since_last_scan,
+    )?;
+    let counted = user_new.data.num_interactions_since_last_scan.is_eq(&count)?;
+
+    // Nothing at all changed: harmless, and it can neither skip a ticket nor reset the count.
+    let same = Boolean::kary_and(&[
+        user_new.data.is_eq(&user_old.data)?,
+        user_new
+            .zk_fields
+            .callback_hash
+            .is_eq(&user_old.zk_fields.callback_hash)?,
+        user_new
+            .zk_fields
+            .new_in_progress_callback_hash
+            .is_eq(&user_old.zk_fields.new_in_progress_callback_hash)?,
+        user_new
+            .zk_fields
+            .old_in_progress_callback_hash
+            .is_eq(&user_old.zk_fields.old_in_progress_callback_hash)?,
+        user_new
+            .zk_fields
+            .is_ingest_over
+            .is_eq(&user_old.zk_fields.is_ingest_over)?,
+    ])?;
+
+    Ok((real & counted) | same)
 }
 
 pub fn get_callbacks() -> Vec<Callback<F, MsgUser, Args, ArgsVar>> {
@@ -978,6 +1131,15 @@ pub fn get_scan_interaction<CBul: PublicCallbackBul<F, Args, Cr> + Clone, const 
 -> ScanInt<CBul, N> {
     Interaction {
         meth: (scan_method::<CBul, N>, scan_predicate::<CBul, N>),
+        callbacks: [],
+    }
+}
+
+/// The dummy form of a scan: the same circuit, so the same keys and the same public shape.
+pub fn get_dummy_scan_interaction<CBul: PublicCallbackBul<F, Args, Cr> + Clone, const N: usize>()
+-> ScanInt<CBul, N> {
+    Interaction {
+        meth: (dummy_scan_method::<CBul, N>, scan_predicate::<CBul, N>),
         callbacks: [],
     }
 }
@@ -1186,14 +1348,31 @@ mod join_and_reset_predicate_tests {
     use zk_callbacks::crypto::hash::HasherZK;
 
     /// A predicate over a user, its commitment and one public field element.
-    type Pred = fn(&UserVar<F, MsgUser>, &FpVar<F>, FpVar<F>, ()) -> ArkResult<Boolean<F>>;
+    type Pred<A> = fn(&UserVar<F, MsgUser>, &FpVar<F>, A, ()) -> ArkResult<Boolean<F>>;
 
-    fn satisfied(pred: Pred, user: &User<F, MsgUser>, com: F) -> bool {
+    fn satisfied(pred: Pred<JoinArgsVar<F>>, user: &User<F, MsgUser>, com: F) -> bool {
         let cs = ConstraintSystem::<F>::new_ref();
         let user_var = UserVar::new_witness(cs.clone(), || Ok(user.clone())).unwrap();
         let com_var = FpVar::new_input(cs.clone(), || Ok(com)).unwrap();
-        let account = FpVar::new_input(cs.clone(), || Ok(F::from(42u64))).unwrap();
-        let ok = pred(&user_var, &com_var, account, ()).unwrap();
+        let args = JoinArgs {
+            account: F::from(42u64),
+            pk: crate::persona::member_pk(&user.data.sk),
+        };
+        let args = JoinArgsVar::new_input(cs.clone(), || Ok(args)).unwrap();
+        let ok = pred(&user_var, &com_var, args, ()).unwrap();
+        ok.value().unwrap() && cs.is_satisfied().unwrap()
+    }
+
+    fn satisfied_reset(pred: Pred<ResetArgsVar<F>>, user: &User<F, MsgUser>, com: F) -> bool {
+        let cs = ConstraintSystem::<F>::new_ref();
+        let user_var = UserVar::new_witness(cs.clone(), || Ok(user.clone())).unwrap();
+        let com_var = FpVar::new_input(cs.clone(), || Ok(com)).unwrap();
+        let args = ResetArgs {
+            account: F::from(42u64),
+            nul: user.zk_fields.nul,
+        };
+        let args = ResetArgsVar::new_input(cs.clone(), || Ok(args)).unwrap();
+        let ok = pred(&user_var, &com_var, args, ()).unwrap();
         ok.value().unwrap() && cs.is_satisfied().unwrap()
     }
 
@@ -1250,26 +1429,26 @@ mod join_and_reset_predicate_tests {
     #[test]
     fn not_banned_needs_a_completed_sweep_and_no_ban() {
         let u = fresh();
-        assert!(satisfied(not_banned_pred, &u, u.commit::<Poseidon<2>>()));
+        assert!(satisfied_reset(not_banned_pred, &u, u.commit::<Poseidon<2>>()));
 
         let mut posted = fresh();
         posted.data.num_interactions_since_last_scan = F::from(1u64);
         assert!(
-            !satisfied(not_banned_pred, &posted, F::from(0u64)),
+            !satisfied_reset(not_banned_pred, &posted, F::from(0u64)),
             "not swept since posting"
         );
 
         let mut mid_sweep = fresh();
         mid_sweep.zk_fields.is_ingest_over = false;
         assert!(
-            !satisfied(not_banned_pred, &mid_sweep, F::from(0u64)),
+            !satisfied_reset(not_banned_pred, &mid_sweep, F::from(0u64)),
             "sweep unfinished"
         );
 
         let mut banned = fresh();
         banned.data.banned = F::from(1u64);
         assert!(
-            !satisfied(not_banned_pred, &banned, F::from(0u64)),
+            !satisfied_reset(not_banned_pred, &banned, F::from(0u64)),
             "banned"
         );
     }
@@ -1305,6 +1484,7 @@ mod rate_limit_circuit_tests {
                 context,
                 claimed,
                 i: F::from(i),
+                payload: F::from(0u64),
             })
         })
         .unwrap();

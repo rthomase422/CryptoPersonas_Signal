@@ -20,6 +20,17 @@
 const messageIdByEh = new Map<string, string>();
 
 // Note a persona post so its revocation flag can be kept current.
+// What a persona post needs before it can be queued, once it is proved.
+export type PreparedPersonaPost = {
+  persona?: string;
+  personaFlagged?: boolean;
+  personaEh?: string;
+  personaAnonymous?: boolean;
+  personaRecordBase64?: string;
+  personaBadge?: string;
+  personaContextName?: string;
+};
+
 export function trackPersonaPost(eh: string, messageId: string): void {
   if (!eh || !messageId) {
     return;
@@ -35,24 +46,56 @@ export function getTrackedPersonaPosts(): ReadonlyMap<string, string> {
 // --- the timestamp an own record is placed by ------------------------------------------
 //
 // Every replica must place a record on the SAME barrier, or replicas disagree about when
-// a settlement happened, scans are rejected as stale, and members fork. Recipients used
-// to bucket a record by the server's receive time, which its SENDER never learns — the
-// sender bucketed its own copy by its local clock at emit time instead, and near a barrier
-// boundary (or with a second of clock skew) the two disagreed.
+// a settlement happened, scans are rejected as stale, and members fork. Recipients place an
+// anonymous record by the service timestamp, which a sender cannot choose.
 //
-// So the sender now decides: it places its own record at `stampOwnRecord`'s timestamp
-// and sends the Signal message with exactly that timestamp (enqueueMessageForSend reads
-// it back with `takeOwnRecordSentAt`), and recipients bucket by the message's sent
-// timestamp (personasBarrier `recordTimestamp`). Strictly increasing per process, so two
-// records never share a Signal timestamp.
+// The sender does not know that timestamp yet when it applies its own record, so it places
+// it provisionally at `stampOwnRecord`'s timestamp, which it also sends the Signal message
+// with (enqueueMessageForSend reads it back with `takeOwnRecordSentAt`). The sender is one
+// of the message's recipients, so the service delivers it a copy. That copy cannot be
+// decrypted, but its envelope carries the service timestamp and this sent timestamp, and
+// `settleOwnRecord` moves the record to where every other member placed it. Strictly
+// increasing per process, so two records never share a Signal timestamp.
 const ownRecordSentAt = new Map<string, number>();
 let lastOwnSentAt = 0;
 
-export function stampOwnRecord(recordBase64: string): number {
+type OwnRecord = { groupId: string; recordBase64: string };
+
+// Awaiting their copy from the service, by sent timestamp. Bounded: a record whose copy
+// never comes stays where the sender placed it.
+const MAX_UNSETTLED_RECORDS = 500;
+const unsettledRecords = new Map<number, OwnRecord>();
+let ownRecordSettler: (record: OwnRecord, serverMs: number) => void = () => undefined;
+
+export function setOwnRecordSettler(
+  settler: (record: OwnRecord, serverMs: number) => void
+): void {
+  ownRecordSettler = settler;
+}
+
+export function stampOwnRecord(groupId: string, recordBase64: string): number {
   const sentAt = Math.max(Date.now(), lastOwnSentAt + 1);
   lastOwnSentAt = sentAt;
   ownRecordSentAt.set(recordBase64, sentAt);
+  unsettledRecords.set(sentAt, { groupId, recordBase64 });
+  if (unsettledRecords.size > MAX_UNSETTLED_RECORDS) {
+    const [oldest] = unsettledRecords.keys();
+    if (oldest != null) {
+      unsettledRecords.delete(oldest);
+    }
+  }
   return sentAt;
+}
+
+// The service delivered a copy of a phantom message we could not decrypt because we already
+// used that chain step. If it is one of ours, this is the timestamp to place it by. Used
+// once per record: a later message claiming the same sent timestamp changes nothing.
+export function settleOwnRecord(sentAtMs: number, serverMs: number): void {
+  const record = unsettledRecords.get(sentAtMs);
+  if (record && serverMs > 0) {
+    unsettledRecords.delete(sentAtMs);
+    ownRecordSettler(record, serverMs);
+  }
 }
 
 export function takeOwnRecordSentAt(recordBase64: string | undefined): number | undefined {

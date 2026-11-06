@@ -27,7 +27,6 @@
 
 use std::path::Path;
 
-use ark_r1cs_std::fields::fp::FpVar;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
 use ark_snark::SNARK;
 use ark_std::rand::{CryptoRng, RngCore};
@@ -36,7 +35,8 @@ use personas_core::circuits::{
     PseudonymArgsPairVar, PseudonymArgsRate, PseudonymArgsVar, PubScan, ScanInt, authorship_pred,
     badge_pred, get_badge_request_interaction, get_callbacks, get_scan_interaction,
     get_standard_interaction, get_standard_pseudo_interaction,
-    get_standard_pseudo_rate_interaction, join_pred, not_banned_pred, pseudonym_pred,
+    JoinArgs, JoinArgsVar, ResetArgs, ResetArgsVar, get_standard_pseudo_rate_interaction,
+    join_pred, not_banned_pred, pseudonym_pred,
 };
 use personas_core::params::ServerKeys;
 use personas_core::{Cr, F, H, PK, Snark, VK};
@@ -271,10 +271,7 @@ pub fn generate_merkle_circuit_keys<S: SNARK<F>>(
     let (standard_proving_key, standard_verifying_key) = get_standard_interaction()
         .generate_keys::<H, S, Cr, MerkleOStore>(rng, None, F::from(0), false);
 
-    let dummy_pseudo = PseudonymArgs {
-        context: F::from(0),
-        claimed: F::from(0),
-    };
+    let dummy_pseudo = PseudonymArgs::default();
     let (standard_pseudo_proving_key, standard_pseudo_verifying_key) =
         get_standard_pseudo_interaction().generate_keys::<H, S, Cr, MerkleOStore>(
             rng,
@@ -283,11 +280,7 @@ pub fn generate_merkle_circuit_keys<S: SNARK<F>>(
             false,
         );
 
-    let dummy_pseudo_rate = PseudonymArgsRate {
-        i: F::from(0),
-        context: F::from(0),
-        claimed: F::from(0),
-    };
+    let dummy_pseudo_rate = PseudonymArgsRate::default();
     let (standard_pseudor_proving_key, standard_pseudor_verifying_key) =
         get_standard_pseudo_rate_interaction().generate_keys::<H, S, Cr, MerkleOStore>(
             rng,
@@ -363,19 +356,24 @@ pub fn generate_merkle_circuit_keys<S: SNARK<F>>(
     // A join proves its object is fresh: a statement about the object alone (no
     // membership — it is not in any tree yet), its commitment the first public input.
     let (join_pred_proving_key, join_pred_verifying_key) =
-        generate_keys_for_statement::<F, H, MsgUser, F, FpVar<F>, (), (), S>(
+        generate_keys_for_statement::<F, H, MsgUser, JoinArgs<F>, JoinArgsVar<F>, (), (), S>(
             rng,
             join_pred,
-            F::from(0u64),
+            JoinArgs::default(),
         );
     // A reset request proves a CURRENT object (membership) is unbanned and just swept.
     let (not_banned_pred_proving_key, not_banned_pred_verifying_key) =
-        generate_keys_for_statement_in::<F, H, MsgUser, F, FpVar<F>, (), (), S, MerkleOStore>(
-            rng,
-            not_banned_pred,
-            None,
-            F::from(0u64),
-        );
+        generate_keys_for_statement_in::<
+            F,
+            H,
+            MsgUser,
+            ResetArgs<F>,
+            ResetArgsVar<F>,
+            (),
+            (),
+            S,
+            MerkleOStore,
+        >(rng, not_banned_pred, None, ResetArgs::default());
 
     MerkleCircuitKeys {
         standard: (standard_proving_key, standard_verifying_key),
@@ -587,14 +585,14 @@ mod publish_tests {
 mod tests {
     use super::*;
     use ark_bn254::Fr;
-    use ark_r1cs_std::fields::fp::FpVar;
-    use personas_core::circuits::{
+        use personas_core::circuits::{
         PrivScan, PrivScanVar, PubScan as PubScanAlias, PubScanVar, get_scan_interaction,
     };
     use personas_core::{Args, ArgsVar};
     use rand::{SeedableRng, rngs::StdRng};
     use zk_callbacks::generic::bulletin::{PublicUserBul, UserBul};
     use zk_callbacks::generic::user::User;
+    use ark_r1cs_std::fields::fp::FpVar;
     use zk_callbacks::impls::centralized::crypto::FakeSigPubkey;
 
     // Small heights keep the circuits tiny; the mechanism under test (root as a

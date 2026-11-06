@@ -255,11 +255,17 @@ pub async fn fold_scan(
         ));
     }
 
+    // The object folded from is spent, like any other: without this a member could fold
+    // again from an object from before a ban.
+    let old_nul = proof.extra_verif.1;
+    if !<OStore as UserBul<F, MsgUser>>::has_never_received_nul(&st.db.obj_bul, &old_nul) {
+        return Err(AppError::Rejected("Fold scan reuses a nullifier".into()));
+    }
     let ps = scan_pub_args(&st.db);
     <OStore as UserBul<F, MsgUser>>::append_value::<PubScan, Snark, 0>(
         &mut st.db.obj_bul,
         proof.z_i[0],
-        F::from(0),
+        old_nul,
         [],
         ps,
         <Snark as SNARK<F>>::Proof::default(),

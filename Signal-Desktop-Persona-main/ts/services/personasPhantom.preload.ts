@@ -549,7 +549,7 @@ export async function turnOnPersonasInGroup(
 export type AdoptResult = 'adopted' | 'duplicate' | 'conflict' | 'full' | 'disabled';
 
 // Adopt a bundle received from a fellow member of the group it names. The caller must
-// already have checked that (isFellowGroupMember).
+// already have checked that it is an admin of the group (isFellowGroupMember).
 //
 // FIRST ONE WINS, AND IT IS FINAL, per group. A second, different bundle for a group is
 // refused: switching would silently strand our chain, and a member being fed a different
@@ -601,13 +601,19 @@ export async function adoptPhantomBundle(
 
 // Whether a conversation (the 1:1 chat a bundle arrived in) belongs to someone who is a
 // full member of `groupId`, a group we are in. Bundles from anyone else are ignored.
+//
+// An admin, not just any member: the first bundle is final, so one from an ordinary member
+// who got there first could cut a newcomer off from the group and read all they send.
 export function isFellowGroupMember(conversationId: string, groupId: string): boolean {
   const group = window.ConversationController.get(groupId);
+  const serviceId = window.ConversationController.get(conversationId)?.getServiceId();
   return (
     group != null &&
     isGroupV2(group.attributes) &&
     !group.get('left') &&
-    group.getMemberConversationIds().has(conversationId)
+    group.getMemberConversationIds().has(conversationId) &&
+    serviceId != null &&
+    group.isAdmin(serviceId)
   );
 }
 
@@ -753,7 +759,8 @@ async function distributeOne(mat: PhantomMaterial, json: string): Promise<void> 
   const sent = new Set(itemStorage.get('personasPhantomSentTo') ?? []);
   const pending = new Map<string, ConversationModel>();
   const group = window.ConversationController.get(mat.groupId);
-  if (group && isGroupV2(group.attributes) && !group.get('left')) {
+  // Members adopt a bundle only from an admin, so only an admin hands it out.
+  if (group && isGroupV2(group.attributes) && !group.get('left') && group.areWeAdmin()) {
     for (const member of group.getMembers()) {
       const serviceId = member.getServiceId();
       if (!serviceId || isMe(member.attributes)) {

@@ -43,6 +43,7 @@ pub mod callback;
 pub mod gadget;
 pub mod obj;
 pub mod params;
+pub mod sparse;
 pub mod tree;
 
 pub use callback::{

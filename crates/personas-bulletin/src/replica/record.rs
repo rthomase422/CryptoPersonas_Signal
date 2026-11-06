@@ -27,7 +27,7 @@
 //! those envelope bytes, never a messenger id (§4: ids are sender-set and
 //! non-unique, so any cross-reference keyed on one is forgeable).
 
-use ark_ff::PrimeField;
+use ark_ff::{BigInteger, PrimeField};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
 use blake2::{Blake2s256, Digest};
 use serde::de::Error as _;
@@ -43,7 +43,11 @@ use personas_core::{Args, Cr, F, Snark};
 ///
 /// 3: a join carries the joining account and a proof that its object is fresh, and a
 /// group admin's re-join approval exists. A version-2 record is refused.
-pub const SERVERLESS_VERSION: u16 = 3;
+///
+/// 4: proofs bind their payload, a join carries the member's public key, a re-join
+/// approval can spend the object given up, and a record's identity no longer depends on
+/// its proof bytes or view claim.
+pub const SERVERLESS_VERSION: u16 = 4;
 
 /// Records are compressed, matching `personas_wire`'s reasoning: every member
 /// downloads every record forever, so halving a proof is worth the point
@@ -63,18 +67,19 @@ pub type PredProof = <Snark as ark_snark::SNARK<F>>::Proof;
 // Eh — the envelope hash
 // ---------------------------------------------------------------------------------------
 
-/// The collision-resistant hash of an encoded record.
+/// A record's identity: the collision-resistant hash of what it states.
 ///
 /// Every cross-reference in the protocol — a rating's target, a vote's poll, an
-/// admin ban's post — names an `Eh`, because a record's *content* is the only
-/// thing about it that cannot be forged or duplicated. It is a byte digest (so it
+/// admin ban's post — names an `Eh`, so it must not change when a record is re-encoded.
+/// A Groth16 proof can be re-randomized by anyone and a view claim is outside every proof,
+/// so neither is part of it (see [`identity`]). It is a byte digest (so it
 /// is `Hash`/`Eq` and keys a map cleanly); the field-element a circuit needs (a
 /// poll or rating **context**) is derived from it by [`Eh::context`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Eh(pub [u8; 32]);
 
 impl Eh {
-    /// The digest of an encoded record.
+    /// The digest of some bytes. A record's own `Eh` comes from [`identity`].
     pub fn of_bytes(bytes: &[u8]) -> Self {
         let mut h = Blake2s256::new();
         h.update(bytes);
@@ -179,6 +184,15 @@ pub enum PollKind {
     Ban,
 }
 
+/// The object a member gives up by re-joining: its `not_banned_pred` proof and the
+/// nullifier and root that proof is about.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SpentObject {
+    pub nul: Ark<Nul<F>>,
+    pub root: Ark<F>,
+    pub proof: Ark<PredProof>,
+}
+
 /// A serverless record: one accept-rule input, self-describing from its bytes.
 ///
 /// Every proof-carrying variant names the `obj_root` it was built on, because the
@@ -203,28 +217,45 @@ pub enum Record {
     /// joining Signal account (`personas_core::account_field` of its ACI); the replica
     /// allows one join per account plus one per admin re-join approval, and the client
     /// refuses a join whose `account` is not the account that sent it.
+    ///
+    /// `pk` is the member's public key, proved to be a hash of its `sk`. The replica ties
+    /// each `pk` to one account, so two accounts cannot share an `sk` (and so a ban on one
+    /// cannot miss the other), and a re-join must use the account's original `pk`.
     Join {
         object: Ark<Com<F>>,
         old_nul: Ark<Nul<F>>,
         account: Ark<F>,
+        pk: Ark<F>,
         proof: Ark<PredProof>,
     },
 
     /// A group admin allows `account` ONE more join (after a reset request). Carries no
     /// proof; the client accepts it only when its sender is a Signal group admin, and
     /// it is sent under the admin's own account so every member can check that.
-    RejoinApprove { account: Ark<F> },
+    ///
+    /// `spent` carries the requester's `not_banned_pred` proof when it has one, and
+    /// approving spends that object. It is `None` only for a member whose object fell off
+    /// the bulletin, which an admin has to take on trust.
+    RejoinApprove {
+        account: Ark<F>,
+        spent: Option<SpentObject>,
+    },
 
     /// A post. `extra` is the flavour's public arguments: empty for `Anon`,
     /// `[context, claimed]` for `Pseudo`, `[context, claimed, i]` for
     /// `PseudoRate`. The context of a plain pseudonym is member-chosen (not a
     /// replica-derived one), so it rides in the proof's public inputs and the
     /// replica pins only `obj_root`.
+    ///
+    /// `payload` is [`post_payload`] of `body`, a public input of the proof, so the text
+    /// cannot be changed under the proof. It is its own field because a late joiner gets
+    /// the record with `body` removed and must still verify the proof.
     Post {
         flavour: Flavour,
         exec: Ark<PostExec>,
         extra: Ark<Vec<F>>,
         body: String,
+        payload: Ark<F>,
         obj_root: Ark<F>,
     },
 
@@ -345,7 +376,10 @@ impl Record {
     pub fn relayable(&self) -> bool {
         !matches!(
             self,
-            Record::Join { .. } | Record::RejoinApprove { .. } | Record::Ban { .. }
+            Record::Join { .. }
+                | Record::RejoinApprove { .. }
+                | Record::Ban { .. }
+                | Record::BadgeApprove { .. }
         )
     }
 }
@@ -414,9 +448,7 @@ pub enum CodecError {
 
 /// Encode a record and return the bytes together with their [`Eh`].
 ///
-/// The two always travel together: a record's identity *is* the hash of its
-/// bytes, so computing it anywhere other than at encode/decode time invites two
-/// callers hashing subtly different serialisations.
+/// The two always travel together, so no caller computes an identity of its own.
 pub fn encode(record: &Record) -> Result<(Vec<u8>, Eh), CodecError> {
     encode_with_view(record, None)
 }
@@ -436,13 +468,151 @@ pub fn encode_with_view(
         kind: record.kind(),
         source,
     })?;
-    let eh = Eh::of_bytes(&bytes);
+    let eh = identity(record)?;
     Ok((bytes, eh))
 }
 
-/// Decode a record, returning it with the [`Eh`] recomputed from the bytes
-/// exactly as read — so a decoded record's identity is what any other replica
-/// would compute for the same bytes, not something the sender could assert.
+fn hash_fields(h: &mut Blake2s256, fields: &[F]) {
+    for field in fields {
+        h.update(field.into_bigint().to_bytes_le());
+    }
+}
+
+fn hash_bytes(h: &mut Blake2s256, bytes: &[u8]) {
+    h.update((bytes.len() as u64).to_le_bytes());
+    h.update(bytes);
+}
+
+/// The field element a proof binds as its payload, from a tagged hash.
+fn payload_of(tag: &[u8], write: impl FnOnce(&mut Blake2s256)) -> F {
+    let mut h = Blake2s256::new();
+    hash_bytes(&mut h, tag);
+    write(&mut h);
+    F::from_le_bytes_mod_order(&h.finalize())
+}
+
+/// The payload of a post: its text.
+pub fn post_payload(body: &str) -> F {
+    payload_of(b"personas post", |h| hash_bytes(h, body.as_bytes()))
+}
+
+/// The payload of a ballot: the poll and the option chosen.
+pub fn ballot_payload(poll: Eh, option: u32) -> F {
+    payload_of(b"personas ballot", |h| {
+        h.update(poll.0);
+        h.update(option.to_le_bytes());
+    })
+}
+
+/// The payload of a rating: the record rated and by how much.
+pub fn rating_payload(target: Eh, delta: i8) -> F {
+    payload_of(b"personas rating", |h| {
+        h.update(target.0);
+        h.update(delta.to_le_bytes());
+    })
+}
+
+/// A record's [`Eh`].
+///
+/// A proof-carrying record is identified by its statement, the values its proof is about.
+/// Anything else in its bytes can be changed by whoever relays it, and a copy that differed
+/// only there must count as the same record, or it could displace the original and leave
+/// bans and ratings aimed at nothing. A scan is not identified this way: nothing refers to
+/// one, and its proof is checked against state that changes, so its identity includes the
+/// proof and a forged copy cannot stand in for it.
+pub fn identity(record: &Record) -> Result<Eh, CodecError> {
+    let mut h = Blake2s256::new();
+    hash_bytes(&mut h, record.kind().as_bytes());
+    match record {
+        Record::Join {
+            object,
+            account,
+            pk,
+            ..
+        } => hash_fields(&mut h, &[object.0, account.0, pk.0]),
+        Record::Post {
+            flavour,
+            exec,
+            extra,
+            payload,
+            obj_root,
+            ..
+        } => {
+            h.update([*flavour as u8]);
+            hash_fields(
+                &mut h,
+                &[exec.0.new_object, exec.0.old_nullifier, exec.0.cb_com_list[0]],
+            );
+            hash_fields(&mut h, &extra.0);
+            hash_fields(&mut h, &[payload.0, obj_root.0]);
+        }
+        Record::BadgeRequest {
+            exec,
+            slot,
+            obj_root,
+        } => {
+            h.update([*slot]);
+            hash_fields(
+                &mut h,
+                &[
+                    exec.0.new_object,
+                    exec.0.old_nullifier,
+                    exec.0.cb_com_list[0],
+                    obj_root.0,
+                ],
+            );
+        }
+        Record::Rate {
+            target,
+            delta,
+            claimed,
+            obj_root,
+            ..
+        } => {
+            h.update(target.0);
+            h.update(delta.to_le_bytes());
+            hash_fields(&mut h, &[claimed.0, obj_root.0]);
+        }
+        Record::Vote {
+            poll,
+            option,
+            claimed,
+            obj_root,
+            ..
+        } => {
+            h.update(poll.0);
+            h.update(option.to_le_bytes());
+            hash_fields(&mut h, &[claimed.0, obj_root.0]);
+        }
+        Record::RejoinApprove { account, spent } => {
+            hash_fields(&mut h, &[account.0]);
+            if let Some(spent) = spent {
+                hash_fields(&mut h, &[spent.nul.0, spent.root.0]);
+            }
+        }
+        Record::Scan { .. }
+        | Record::PollOpen { .. }
+        | Record::BadgeApprove { .. }
+        | Record::Ban { .. } => {
+            let mut bytes = Vec::new();
+            let envelope = EnvelopeRef {
+                v: SERVERLESS_VERSION,
+                record,
+                view: None,
+            };
+            ciborium::into_writer(&envelope, &mut bytes).map_err(|source| CodecError::Encode {
+                kind: record.kind(),
+                source,
+            })?;
+            hash_bytes(&mut h, &bytes);
+        }
+    }
+    Ok(Eh(h.finalize().into()))
+}
+
+/// Decode a record, returning it with its [`Eh`] recomputed — so a decoded record's
+/// identity is what any other replica would compute, not something the sender could
+/// assert.
 pub fn decode(bytes: &[u8]) -> Result<(Record, Eh), CodecError> {
     decode_with_view(bytes).map(|(record, eh, _)| (record, eh))
 }
@@ -454,17 +624,18 @@ pub fn decode_with_view(bytes: &[u8]) -> Result<(Record, Eh, Option<ViewClaim>),
     if envelope.v != SERVERLESS_VERSION {
         return Err(CodecError::Version { found: envelope.v });
     }
-    Ok((envelope.record, Eh::of_bytes(bytes), envelope.view))
+    let eh = identity(&envelope.record)?;
+    Ok((envelope.record, eh, envelope.view))
 }
 
 /// The record re-encoded WITHOUT its private text — a post's body, a poll's question
 /// and option labels (the number of options stays: a vote names one by index) — for
 /// handing to a late joiner who should not read the group's past messages.
 ///
-/// The bytes no longer hash to the record's [`Eh`], so whoever stores them must keep
-/// the original `Eh` beside them ([`super::Replica::import_records`]). Nothing the
-/// replica derives depends on the removed text: no proof covers it, and ratings and
-/// polls refer to records by their original `Eh`.
+/// A stripped poll no longer has its original [`Eh`], so whoever stores it must keep that
+/// beside it ([`super::Replica::import_records`]). Nothing the replica derives depends on
+/// the removed text: a post's proof covers `payload`, which stays, and ratings and polls
+/// refer to records by their original `Eh`.
 pub fn strip_private_text(bytes: &[u8]) -> Result<Vec<u8>, CodecError> {
     let (mut record, _, view) = decode_with_view(bytes)?;
     match &mut record {
@@ -493,6 +664,7 @@ mod tests {
             object: Ark(F::rand(&mut rng)),
             old_nul: Ark(F::rand(&mut rng)),
             account: Ark(F::rand(&mut rng)),
+            pk: Ark(F::rand(&mut rng)),
             proof: Ark(PredProof::default()),
         };
         let (bytes, eh) = encode(&rec).unwrap();
@@ -571,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn a_view_claim_round_trips_and_is_covered_by_the_eh() {
+    fn a_view_claim_round_trips_and_is_not_part_of_the_eh() {
         let rec = Record::PollOpen {
             question: "q".into(),
             options: vec!["a".into()],
@@ -584,7 +756,7 @@ mod tests {
         };
         let (plain, plain_eh) = encode(&rec).unwrap();
         let (bytes, eh) = encode_with_view(&rec, Some(claim)).unwrap();
-        assert_ne!(eh, plain_eh, "the claim is part of the record's identity");
+        assert_eq!(eh, plain_eh, "the claim is outside every proof, so not the identity");
         let (_, eh2, back) = decode_with_view(&bytes).unwrap();
         assert_eq!((eh2, back), (eh, Some(claim)));
         // A record without a claim reads back without one, and still decodes plainly.

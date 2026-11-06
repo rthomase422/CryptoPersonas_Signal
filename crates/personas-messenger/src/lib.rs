@@ -43,10 +43,11 @@ use tokio::sync::Mutex;
 use transport_api::{ConversationId, Incoming, Sent, Transport, TransportError};
 
 use personas_bulletin::merkle::callback::{DEFAULT_CB_MEMB_HEIGHT, DEFAULT_CB_NMEMB_HEIGHT};
+use personas_bulletin::merkle::MerkleObjStore;
 use personas_bulletin::merkle::obj::DEFAULT_OBJ_HEIGHT;
-use personas_bulletin::replica::record::{self, Ark, Eh, Flavour, PollKind, Record};
+use personas_bulletin::replica::record::{self, Ark, Eh, Flavour, PollKind, Record, SpentObject};
 use personas_bulletin::replica::{
-    Config, Replica, ReplicaKeys, Status, VIEW_CLAIM_LAG, ViewReport,
+    Config, Replica, ReplicaKeys, Status, VIEW_CLAIM_LAG, ViewReport, SETTLE_LAG,
 };
 use personas_core::{F, persona};
 
@@ -59,6 +60,8 @@ pub enum SendError {
     /// and so cannot produce a proof-carrying record.
     #[error("this messenger is an observer (no member key) and cannot send")]
     Observer,
+    #[error("a reset request's proof could not be read")]
+    BadResetProof,
     #[error(transparent)]
     Member(#[from] MemberError),
     #[error("could not encode a record: {0}")]
@@ -75,6 +78,10 @@ pub enum SendError {
     /// then the member's object would already have moved past it.
     #[error("rate-limited persona #{number} does not exist: each context has {limit}")]
     PersonaIndexOutOfRange { number: u64, limit: usize },
+    /// This member's object changed too recently to prove from: it is not yet in a
+    /// settled root. Wait a barrier or two and try again.
+    #[error("your last action is still settling")]
+    Settling,
     /// A prepared scan is waiting to be committed or discarded; nothing else may be
     /// produced until it is (see [`Messenger::prepare_scan`]).
     #[error("a prepared scan is pending; commit or discard it first")]
@@ -93,6 +100,18 @@ struct PendingScan {
     /// replica's current roots still equal these.
     memb_root: F,
     nmemb_root: F,
+}
+
+/// How far into a barrier the barrier before it counts as settled. Records stamped just
+/// before a boundary reach members well within this; one that takes longer can cost someone
+/// a record, which they get back and send again ([`Messenger::take_lost`]). A schedule with
+/// a period this short never gets there and stays at the full `SETTLE_LAG`.
+pub const SETTLE_MARGIN_MS: u64 = 3_000;
+
+/// A record of ours not yet settled, and the object it spent.
+struct InFlight {
+    eh: Eh,
+    before: zk_callbacks::generic::user::User<F, personas_core::circuits::MsgUser>,
 }
 
 /// A record produced and folded into the sender's own replica, ready to broadcast.
@@ -129,6 +148,13 @@ pub struct Messenger<
     heartbeat: Heartbeat,
     /// A proved scan not yet released (commit) or abandoned (discard).
     pending_scan: Option<PendingScan>,
+    /// This member's newest object-changing record and the object it spent, until the
+    /// record is settled. At most one: the next needs this one's object in a settled root.
+    in_flight: Option<InFlight>,
+    /// Records of ours the group lost, for the client to tell the member about.
+    lost: Vec<Eh>,
+    /// The barrier whose first [`SETTLE_MARGIN_MS`] have passed, by the clock `tick` reads.
+    margin_passed: Option<u64>,
     /// When the operation under way started proving ([`OpTimings`]).
     op_started: Option<std::time::Instant>,
     /// How long the last operation took ([`last_op_timings`](Self::last_op_timings)).
@@ -174,6 +200,9 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
             member,
             heartbeat: Heartbeat::default(),
             pending_scan: None,
+            in_flight: None,
+            lost: Vec::new(),
+            margin_passed: None,
             op_started: None,
             last_op: OpTimings::default(),
             relayed: Default::default(),
@@ -216,6 +245,9 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
             member,
             heartbeat: Heartbeat::default(),
             pending_scan: None,
+            in_flight: None,
+            lost: Vec::new(),
+            margin_passed: None,
             op_started: None,
             last_op: OpTimings::default(),
             relayed: Default::default(),
@@ -246,6 +278,9 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
             member,
             heartbeat: Heartbeat::default(),
             pending_scan: None,
+            in_flight: None,
+            lost: Vec::new(),
+            margin_passed: None,
             op_started: None,
             last_op: OpTimings::default(),
             relayed: Default::default(),
@@ -273,6 +308,9 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
             member,
             heartbeat: Heartbeat::default(),
             pending_scan: None,
+            in_flight: None,
+            lost: Vec::new(),
+            margin_passed: None,
             op_started: None,
             last_op: OpTimings::default(),
             relayed: Default::default(),
@@ -309,6 +347,11 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
     }
 
     /// Scans left in the sweep in progress ([`Member::sweep_remaining`]).
+    /// Whether this member must finish a scan before its next post.
+    pub fn scan_required(&self) -> bool {
+        self.member.as_ref().is_some_and(Member::scan_required)
+    }
+
     pub fn sweep_remaining(&self) -> usize {
         self.member.as_ref().map_or(0, Member::sweep_remaining)
     }
@@ -488,6 +531,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
     /// [`run_heartbeat`](Self::run_heartbeat).
     pub fn barrier(&mut self) {
         self.replica.barrier();
+        self.check_in_flight();
     }
 
     /// Advance the replica to the barrier the shared schedule says `now_ms` (a
@@ -496,7 +540,11 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
     /// only to move the monotone "how far has now got" counter, never to place a record
     /// (§14, d5). Returns the barrier the replica is now at.
     pub fn tick(&mut self, now_ms: u64) -> u64 {
-        self.replica.advance_to(self.heartbeat.barrier_at(now_ms));
+        let barrier = self.heartbeat.barrier_at(now_ms);
+        self.replica.advance_to(barrier);
+        let margin_ago = self.heartbeat.barrier_at(now_ms.saturating_sub(SETTLE_MARGIN_MS));
+        self.margin_passed = (margin_ago == barrier).then_some(barrier);
+        self.check_in_flight();
         self.replica.current_barrier()
     }
 
@@ -562,41 +610,61 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
         self.emit(Record::Ban { target })
     }
 
-    pub fn emit_rejoin_approve(&mut self, account: F) -> Result<Emitted, SendError> {
+    ///
+    /// `proof` is the request's `not_banned_pred` proof, when it has one: approving spends
+    /// the object it names.
+    pub fn emit_rejoin_approve(
+        &mut self,
+        account: F,
+        proof: Option<&[u8]>,
+    ) -> Result<Emitted, SendError> {
         if self.member.is_none() {
             return Err(SendError::Observer);
         }
-        // No proof: nothing to time but the fold.
+        let spent = proof
+            .map(|bytes| {
+                let (proof, inputs) = personas_core::decode_not_banned_proof(bytes)
+                    .ok_or(SendError::BadResetProof)?;
+                Ok::<_, SendError>(SpentObject {
+                    nul: Ark(inputs[1]),
+                    root: Ark(inputs[2]),
+                    proof: Ark(proof),
+                })
+            })
+            .transpose()?;
+        // No proof to make: nothing to time but the fold.
         self.op_started = None;
         self.emit(Record::RejoinApprove {
             account: Ark(account),
+            spent,
         })
     }
 
     /// Prove this member is not banned and has just completed a scan sweep, as
     /// `account`, against the replica's current root — the proof a reset request
-    /// carries. Encoded as `personas_core::encode_not_banned_proof` (`[account, root]`).
+    /// carries. Encoded as `personas_core::encode_not_banned_proof` (`[account, nul, root]`).
     pub fn prove_not_banned(
         &mut self,
         rng: &mut (impl CryptoRng + RngCore),
         account: F,
     ) -> Result<Vec<u8>, SendError> {
-        let (root, proof) = {
-            let (replica, member) = self.parts_mut()?;
-            member.not_banned(rng, replica.obj_store(), account)?
+        let (nul, root, proof) = {
+            let (_, settled, member) = self.parts_mut()?;
+            member.not_banned(rng, settled, account)?
         };
-        let out = personas_core::encode_not_banned_proof(&proof, &[account, root])?;
+        let out = personas_core::encode_not_banned_proof(&proof, &[account, nul, root])?;
         self.record_proof_only(out.len());
         Ok(out)
     }
 
-    /// Start over as a brand-new member (fresh object, new secret key), keeping the
-    /// replica. Only useful once an admin approved a re-join for this account.
+    /// Start over with a fresh object under the same secret key, keeping the replica. Only useful once an admin approved a re-join for this account.
     pub fn reset_member(&mut self, rng: &mut (impl CryptoRng + RngCore)) -> Result<(), SendError> {
         if self.pending_scan.is_some() {
             return Err(SendError::ScanPending);
         }
         self.member.as_mut().ok_or(SendError::Observer)?.reset(rng);
+        // Whatever was in flight belonged to the object this replaces.
+        self.in_flight = None;
         Ok(())
     }
 
@@ -606,11 +674,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
         rng: &mut (impl CryptoRng + RngCore),
         body: impl Into<String>,
     ) -> Result<Emitted, SendError> {
-        let record = {
-            let (replica, member) = self.parts_mut()?;
-            member.post_anon(rng, replica.obj_store(), body)?
-        };
-        self.emit(record)
+        self.emit_spending(|_, settled, member| member.post_anon(rng, settled, body))
     }
 
     /// Produce a pseudonymous post under `context`.
@@ -620,11 +684,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
         body: impl Into<String>,
         context: F,
     ) -> Result<Emitted, SendError> {
-        let record = {
-            let (replica, member) = self.parts_mut()?;
-            member.post_pseudo(rng, replica.obj_store(), body, context)?
-        };
-        self.emit(record)
+        self.emit_spending(|_, settled, member| member.post_pseudo(rng, settled, body, context))
     }
 
     /// Produce a rate-limited pseudonymous post (`i`-th persona for `context`).
@@ -644,11 +704,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
                 limit,
             });
         }
-        let record = {
-            let (replica, member) = self.parts_mut()?;
-            member.post_pseudo_rate(rng, replica.obj_store(), body, context, i)?
-        };
-        self.emit(record)
+        self.emit_spending(|_, settled, member| member.post_pseudo_rate(rng, settled, body, context, i))
     }
 
     /// Open a poll (no proof). `target` is the post under review for a ban poll.
@@ -675,10 +731,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
         poll: Eh,
         option: u32,
     ) -> Result<Emitted, SendError> {
-        let record = {
-            let (replica, member) = self.parts_mut()?;
-            member.vote(rng, replica.obj_store(), poll, option)?
-        };
+        let record = self.prove_identity(|member, settled| member.vote(rng, settled, poll, option))?;
         self.emit(record)
     }
 
@@ -689,10 +742,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
         target: Eh,
         delta: i8,
     ) -> Result<Emitted, SendError> {
-        let record = {
-            let (replica, member) = self.parts_mut()?;
-            member.rate(rng, replica.obj_store(), target, delta)?
-        };
+        let record = self.prove_identity(|member, settled| member.rate(rng, settled, target, delta))?;
         self.emit(record)
     }
 
@@ -714,8 +764,8 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
         context_b: F,
     ) -> Result<Vec<u8>, SendError> {
         let (root, claimed_a, claimed_b, proof) = {
-            let (replica, member) = self.parts_mut()?;
-            member.authorship(rng, replica.obj_store(), context_a, context_b)?
+            let (_, settled, member) = self.parts_mut()?;
+            member.authorship(rng, settled, context_a, context_b)?
         };
         // PUBLIC INPUT LAYOUT: pub_args first, THEN the membership root.
         //
@@ -746,11 +796,7 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
         rng: &mut (impl CryptoRng + RngCore),
         slot: u8,
     ) -> Result<Emitted, SendError> {
-        let record = {
-            let (replica, member) = self.parts_mut()?;
-            member.badge_request(rng, replica.obj_store(), slot)?
-        };
-        self.emit(record)
+        self.emit_spending(|_, settled, member| member.badge_request(rng, settled, slot))
     }
 
     /// Emit an APPROVAL of a badge request, naming the request's envelope hash.
@@ -776,8 +822,8 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
         badge: F,
     ) -> Result<Vec<u8>, SendError> {
         let (root, proof) = {
-            let (replica, member) = self.parts_mut()?;
-            member.badge(rng, replica.obj_store(), i, badge)?
+            let (_, settled, member) = self.parts_mut()?;
+            member.badge(rng, settled, i, badge)?
         };
         // pub_args first, then the root — the Merkle convention.
         let out = personas_core::encode_badge_proof(&proof, &[i, badge, root])?;
@@ -791,11 +837,9 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
         &mut self,
         rng: &mut (impl CryptoRng + RngCore),
     ) -> Result<Emitted, SendError> {
-        let record = {
-            let (replica, member) = self.parts_mut()?;
-            member.scan(rng, replica.obj_store(), replica.callback_store())?
-        };
-        self.emit(record)
+        self.emit_spending(|replica, settled, member| {
+            member.scan(rng, settled, replica.callback_store())
+        })
     }
 
     // --- Send: a scan that can be checked before it is released (§5.2) ----------
@@ -816,14 +860,23 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
     // discarded scan would have revealed has never been revealed, and the restored
     // object is safe to spend. Nothing else can be produced while a scan is pending.
 
-    /// Prove a scan without releasing it. Returns its envelope hash only.
-    pub fn prepare_scan(&mut self, rng: &mut (impl CryptoRng + RngCore)) -> Result<Eh, SendError> {
+    /// Prove a scan without releasing it. Returns its envelope hash only. A `dummy` scan
+    /// changes nothing and only fills this member's count of scans for the epoch.
+    pub fn prepare_scan(
+        &mut self,
+        rng: &mut (impl CryptoRng + RngCore),
+        dummy: bool,
+    ) -> Result<Eh, SendError> {
         let (record, before, memb_root, nmemb_root) = {
-            let (replica, member) = self.parts_mut()?;
+            let (replica, settled, member) = self.parts_mut()?;
             let before = member.user.clone();
             let cbs = replica.callback_store();
             let (memb_root, nmemb_root) = (cbs.memb_root(), cbs.nmemb_root());
-            let record = member.scan(rng, replica.obj_store(), cbs)?;
+            let record = if dummy {
+                member.dummy_scan(rng, settled, cbs)?
+            } else {
+                member.scan(rng, settled, cbs)?
+            };
             (record, before, memb_root, nmemb_root)
         };
         let (bytes, eh) = record::encode_with_view(&record, self.view_claim())?;
@@ -861,6 +914,10 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
         let started = std::time::Instant::now();
         let _ = self.replica.ingest(pending.emitted.bytes.clone());
         self.last_op.self_ingest_us = micros_since(started);
+        self.in_flight = Some(InFlight {
+            eh: pending.emitted.eh,
+            before: pending.before,
+        });
         Ok(pending.emitted)
     }
 
@@ -1012,15 +1069,133 @@ impl<const OH: usize, const MH: usize, const NH: usize> Messenger<OH, MH, NH> {
 
     /// Split the disjoint `replica`/`member` fields so a produce step can read the
     /// object tree while mutating the member's user state.
-    fn parts_mut(&mut self) -> Result<(&Replica<OH, MH, NH>, &mut Member), SendError> {
+    fn parts_mut(
+        &mut self,
+    ) -> Result<(&Replica<OH, MH, NH>, &MerkleObjStore<F, OH>, &mut Member), SendError> {
         // Every proving flow comes through here: none may run on top of a pending scan.
         if self.pending_scan.is_some() {
             return Err(SendError::ScanPending);
         }
         // ...so this is where proving starts, for OpTimings.
         self.op_started = Some(std::time::Instant::now());
+        let lag = self.proving_lag();
         let member = self.member.as_mut().ok_or(SendError::Observer)?;
-        Ok((&self.replica, member))
+        let settled = self.replica.proving_store_at(lag).ok_or(SendError::Settling)?;
+        if !member.is_on_bulletin(settled) {
+            return Err(if member.is_on_bulletin(self.replica.obj_store()) {
+                SendError::Settling
+            } else {
+                MemberError::NotJoined.into()
+            });
+        }
+        Ok((&self.replica, settled, member))
+    }
+
+    /// Run a producer of an object-changing record, keeping the object it spends so a
+    /// lost record can be taken back ([`Messenger::take_lost`]).
+    fn emit_spending(
+        &mut self,
+        produce: impl FnOnce(&Replica<OH, MH, NH>, &MerkleObjStore<F, OH>, &mut Member) -> Result<Record, MemberError>,
+    ) -> Result<Emitted, SendError> {
+        let (record, before) = {
+            let (replica, settled, member) = self.parts_mut()?;
+            let before = member.user.clone();
+            (produce(replica, settled, member)?, before)
+        };
+        let emitted = self.emit(record)?;
+        self.in_flight = Some(InFlight {
+            eh: emitted.eh,
+            before,
+        });
+        Ok(emitted)
+    }
+
+    fn proving_lag(&self) -> u64 {
+        match self.margin_passed {
+            Some(barrier) if barrier == self.replica.current_barrier() => 1,
+            _ => SETTLE_LAG,
+        }
+    }
+
+    /// Whether this member could prove right now: its object is in a settled root.
+    pub fn is_settled(&self) -> bool {
+        self.member.as_ref().is_some_and(|m| {
+            self.replica
+                .proving_store_at(self.proving_lag())
+                .is_some_and(|settled| m.is_on_bulletin(settled))
+        })
+    }
+
+    /// Whether this member could vote or rate right now, which needs a settled object but
+    /// not its newest one ([`Messenger::prove_identity`]).
+    pub fn can_prove_identity(&self) -> bool {
+        self.is_settled()
+            || self.in_flight.as_ref().is_some_and(|in_flight| {
+                self.replica
+                    .proving_store_at(self.proving_lag())
+                    .is_some_and(|settled| member::object_on_bulletin(&in_flight.before, settled))
+            })
+    }
+
+    /// Prove something that spends nothing, a vote or a rating. Such a proof shows who a
+    /// member is, not what its object holds, and every object of a member shares one key
+    /// and so one pseudonym. So while the newest object settles, the one before it serves:
+    /// the member need not wait and still gets one ballot or rating.
+    fn prove_identity(
+        &mut self,
+        prove: impl FnOnce(&Member, &MerkleObjStore<F, OH>) -> Result<Record, MemberError>,
+    ) -> Result<Record, SendError> {
+        if self.pending_scan.is_some() {
+            return Err(SendError::ScanPending);
+        }
+        self.op_started = Some(std::time::Instant::now());
+        let lag = self.proving_lag();
+        let settled = self.replica.proving_store_at(lag).ok_or(SendError::Settling)?;
+        let member = self.member.as_mut().ok_or(SendError::Observer)?;
+        if member.is_on_bulletin(settled) {
+            return Ok(prove(member, settled)?);
+        }
+        let Some(in_flight) = &self.in_flight else {
+            return Err(if member.is_on_bulletin(self.replica.obj_store()) {
+                SendError::Settling
+            } else {
+                MemberError::NotJoined.into()
+            });
+        };
+        let newest = std::mem::replace(&mut member.user, in_flight.before.clone());
+        let proved = prove(member, settled);
+        member.user = newest;
+        Ok(proved?)
+    }
+
+    /// The re-base (§13). If the group lost this member's newest record, no replica will
+    /// ever apply it, so its nullifier is unspent and the object it spent is still the
+    /// member's: go back to it, or the member would be stranded on an object that does
+    /// not exist. Called on every tick.
+    fn check_in_flight(&mut self) {
+        let Some(in_flight) = &self.in_flight else {
+            return;
+        };
+        if self.replica.is_lost(&in_flight.eh) {
+            let in_flight = self.in_flight.take().expect("just checked");
+            if let Some(member) = self.member.as_mut() {
+                member.user = in_flight.before;
+            }
+            self.lost.push(in_flight.eh);
+        } else if self.is_settled() {
+            self.in_flight = None;
+        }
+    }
+
+    /// Records of ours the group lost since the last call. The member's object is already
+    /// back where it was; what remains is telling them, so they can send again.
+    pub fn take_lost(&mut self) -> Vec<Eh> {
+        std::mem::take(&mut self.lost)
+    }
+
+    /// How many records from others name a root we never produced ([`Replica::foreign_roots`]).
+    pub fn foreign_roots(&self) -> usize {
+        self.replica.foreign_roots()
     }
 }
 

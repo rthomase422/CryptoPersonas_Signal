@@ -34,13 +34,18 @@ import {
   builtPersonasEngines,
   isPersonasEngineEnabled,
   isPostFlagged,
+  getPollStatusLine,
 } from './personasEngine.preload.ts';
-import { drainPersonaScans } from './personasActions.preload.ts';
+import { runScheduledScans } from './personasActions.preload.ts';
+import { decodePostText } from './personasCarriage.std.ts';
+import { verifiedContextName } from './personasTopics.preload.ts';
+import { hasOwnResetRequest } from './personasReset.preload.ts';
 import { getBarrierSchedule } from './personasBarrier.preload.ts';
 import {
   pickScanSlot,
   scanEpochAt,
   scanEpochMs,
+  scansPerEpoch,
 } from './personasScanSchedule.std.ts';
 import { maybeCompletePersonasReset } from './personasReset.preload.ts';
 import { maybeContinueCatchUp } from './personasCatchUp.preload.ts';
@@ -51,7 +56,7 @@ const log = createLogger('personasFlags');
 
 // How often we re-read flags. Cheap (an in-memory engine lookup per tracked post), so
 // it can be brisk enough that a ban visibly lands while you watch.
-const REFRESH_INTERVAL_MS = 2_000;
+const REFRESH_INTERVAL_MS = 1_000;
 
 // How often the loop checks whether a group's scan slot has come.
 const SCAN_TICK_MS = 15_000;
@@ -87,6 +92,18 @@ async function refreshPersonaFlags(): Promise<number> {
     const groupId = window.ConversationController.get(
       message.get('conversationId')
     )?.get('groupId');
+    // A poll: its tally lives in the engine, and a ballot changes nothing on the message,
+    // so copy the line across for the bubble to redraw.
+    if (message.get('personaPoll')) {
+      const status = getPollStatusLine(groupId, eh);
+      if (status != null && status !== message.get('personaPollStatus')) {
+        message.set({ personaPollStatus: status });
+        // eslint-disable-next-line no-await-in-loop
+        await window.MessageCache.saveMessage(message.attributes);
+        changed += 1;
+      }
+      continue;
+    }
     // A post the engine was holding when it arrived (personasEngine's
     // ingestRecordForTimeline): show it once it applies.
     if (message.get('personaPending')) {
@@ -95,8 +112,11 @@ async function refreshPersonaFlags(): Promise<number> {
         continue;
       }
       log.info(`refreshPersonaFlags: ${eh.slice(0, 12)}… applied; showing the held post`);
+      const post = decodePostText(applied.body);
       message.set({
-        body: applied.body,
+        body: post.text,
+        personaBadge: post.badge,
+        personaContextName: verifiedContextName(groupId, eh, post.contextName),
         persona: applied.persona,
         personaAnonymous: applied.persona == null,
         personaFlagged: applied.flagged,
@@ -160,7 +180,8 @@ export function startPersonaFlagLoops(): void {
   log.info(
     `startPersonaFlagLoops: refresh every ${REFRESH_INTERVAL_MS}ms, ` +
       (isAutoScanEnabled()
-        ? `scans once per ${scanEpochMs(process.env.PERSONAS_SCAN_EPOCH_MS) / 60_000} min epoch`
+        ? `${scansPerEpoch(process.env.PERSONAS_SCANS_PER_EPOCH)} scans per ` +
+          `${scanEpochMs(process.env.PERSONAS_SCAN_EPOCH_MS) / 60_000} min epoch`
         : 'scheduled scans OFF (PERSONAS_AUTO_SCAN=off)')
   );
 }
@@ -185,6 +206,11 @@ async function runDueScans(): Promise<void> {
       if (!conversation || !hasJoinedPersonaGroup(groupId)) {
         continue;
       }
+      // A reset request names this object's nullifier. A scan would move on from the
+      // object, and the admin's approval would then be refused.
+      if (hasOwnResetRequest(groupId)) {
+        continue;
+      }
       const anchorMs = getBarrierSchedule(groupId)?.anchorMs ?? 0;
       const now = Date.now();
       const epoch = scanEpochAt(now, anchorMs, epochMs);
@@ -205,8 +231,11 @@ async function runDueScans(): Promise<void> {
       }
       slot.slotMs = null;
       // oxlint-disable-next-line no-await-in-loop
-      await drainPersonaScans(conversation).catch(error =>
-        log.error(`scheduled scan failed: ${toLogFormat(error)}`)
+      await runScheduledScans(
+        conversation,
+        scansPerEpoch(process.env.PERSONAS_SCANS_PER_EPOCH)
+      ).catch(error =>
+        log.error(`scheduled scans failed: ${toLogFormat(error)}`)
       );
     }
   } finally {

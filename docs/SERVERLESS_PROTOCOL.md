@@ -13,6 +13,85 @@ For what exists today, see `ARCHITECTURE.md`. For the bugs this design has to no
 
 ---
 
+## Changes made after the security audit
+
+Where this section and a later one disagree, this section describes the code.
+
+- **Payloads are bound.** A post's text and labels, a ballot's option and a rating's delta are
+  public inputs of their proofs, as a hash (`post_payload`, `ballot_payload`, `rating_payload`).
+- **Identity.** An `Eh` hashes what a record states, not its bytes, so a re-encoded copy or a
+  re-randomized proof is the same record. A scan is the exception, because nothing refers to one.
+  Tampered copies are refused before they are stored (`Replica::admissible`).
+- **Tickets.** A post's published ticket must match the commitment its proof covers.
+- **Object tree.** A sparse tree over each commitment's own slot, one path update per insert.
+- **Members.** A join carries `pk = H(sk)`. Each account has one `pk` and each `pk` one account. A
+  reset keeps `sk`, and an approved re-join spends the old object's nullifier.
+- **Scanning.** Scans ride the phantom and run on a public schedule, a fixed number per epoch, padded
+  with dummy scans that change nothing. An interaction needs a finished sweep, a sweep resets the
+  interaction count only when it ends, and the count is capped at 20.
+- **Timestamps.** Anonymous records go by the service timestamp. A sender is in its own recipient
+  list, and the copy it gets back moves its record to the barrier everyone else used. Joins,
+  re-join approvals and admin bans are not echoed and still go by the sender's timestamp, within
+  10 s of the service's.
+- **Polls** are drawn from the record, and a ban poll always shows fixed wording. A poll stays open
+  24 hours and refuses ballots once closed. A member's first ballot stands.
+- **Ban window.** A ticket lives 48 hours (`Config::for_period_ms`). A ticket waits for a ban poll on
+  it that was opened in time, so a poll cannot run out the clock, and only such a poll can hold it,
+  so polls cannot hold it forever. An anonymous post settled past that is out of reach.
+- **Pseudonyms.** A ban on a settled pseudonymous post moves to the newest unsettled ticket under
+  the same pseudonym. If there is none the pseudonym stays marked, and its next post is flagged and
+  carries the ban. Posts under a banned pseudonym are flagged on sight.
+- **Ratings** are +1 or -1, one per member per post, and cannot be withdrawn. A post's total is
+  clamped to `±R_MAX`, and negative totals now reach the member's reputation.
+- **Admin records.** A badge approval travels under the admin's own account and every member checks
+  that the sender is a group admin, as for bans and re-join approvals. §7 and §11 describe signed
+  records under a configured key. This build uses the sender check instead: a key shared among
+  admins could not be taken back from a demoted one, and a late joiner already trusts an admin's
+  copy of the history. The cost is that a record's authority is checked on arrival, not carried in
+  the record, so a late joiner cannot re-check it (§12).
+- **Roots.** A proof may name only the root at the end of a closed barrier, and members prove against
+  a closed barrier that has had time to settle (see Pacing; `Replica::proving_store_at`). That root depends
+  on the set of records in the barrier and not on their order, so a same-barrier race strands
+  nothing, and every member who received the group's records uses the same root.
+- **Pacing.** A barrier counts as settled `SETTLE_MARGIN_MS` (3 s) into the next one, by the
+  member's clock, so a member's object-changing records are about 3 to 13 s apart, and a sweep of
+  `n` tickets takes `n` times that. A record delayed past the margin can cost someone else a record,
+  which the re-base below returns. Votes and ratings spend nothing and show only who a member is, so
+  they use the member's previous object while the newest settles. It has the same key and so the
+  same pseudonym, which keeps them to one each. Polls, bans and approvals carry no proof and do not
+  wait. A post shows as sending at once and is proved in the background.
+- **Re-basing.** A member keeps the object its newest record spent. If that record is refused, or
+  still waits on an unproduced root after its barrier settles, no replica will apply it, so the
+  member returns to the old object and is told to send again. This state is in memory, so a restart
+  in that window still strands the member until an admin approves a reset.
+- **Selective delivery (§5.5).** A member who sees a settled record naming a root it never produced
+  is warned (`Replica::foreign_roots`). This narrows the audit's H5 but does not close it. A record
+  sent only to a victim still gives the victim a root no one else has, so their records are held
+  back and recognisable until views are repaired. Repair by relay stays off by default, because a
+  relay names its own barrier, and a relayer could use that to backdate a record.
+- **Late join.** Imported records must hash to the identity given and pass their proofs, though a
+  poll's identity covers text the copy leaves out, and a copy can still leave records out. Sender
+  checks cannot be redone, and no genesis pin exists, so §12's trust in the admin stands.
+- **Bundles** are accepted only from a group admin. A bundle's trust root vouches for the phantom
+  certificate only, so its minter cannot forge a real member's sender certificate.
+- **Topics.** A topic's context is a hash of the group and its name, so a name has one context, and
+  a post displays a topic name only if its proof is in that context. Anyone can still create a new
+  topic, so the limit is per name: `AllowedContexts` is not enforced.
+- **Server-mode folding** spends the object it folds from. The fold's depth is still public.
+
+Known gaps, stated for the paper:
+
+- All members share one sender-key chain, so two sends at the same iteration reuse a message key
+  and receivers can disagree about which they keep. Fixing this needs a different routing design.
+- A banned member can still vote and rate. `pseudonym_pred` proves membership of any object ever in
+  the tree, so a check on `banned` could be avoided with an older object. This differs from
+  `F_CryptographicPersona`.
+- Enforcement of a ban stays lazy: a banned member who never scans keeps up to 19 more posts.
+- Self-rating cannot be detected, and no predicate reads reputation yet.
+- Joins, bans and approvals use the sender's timestamp, within 10 s of the service's.
+- A callback's argument is public, since its key is the ticket in the post. Own anonymous posts stay
+  on the sender's device as outgoing messages, so a seized device shows authorship.
+
 ## 1. The one-line difference
 
 In the as-a-service deployment a server holds secret keys, is the sole writer of the bulletin,
@@ -777,8 +856,8 @@ and panics if you interact mid-sweep. Serverless makes fixing that mandatory, no
 | knob | default | what it trades |
 |---|---|---|
 | `heartbeat_secs` (E) | 60 | the settlement-barrier cadence, clocked by service-assigned `serverReceivedTimestamp` (§4). No longer the *ordering* mechanism (prefix-order is, §4). Shorter = tickets settle sooner and the outstanding set stays smaller, but barriers (hence scan-invalidation churn) come more often. **Implemented in d5** (`docs/D5_HEARTBEAT.md`): a record's barrier is `(received_at − genesis) / (heartbeat_secs·1000)`, bucketed by the *provider's* stamp — identical on every replica, so convergence is exact (§5.2's caveat closed). Shared with a `genesis` anchor (out of band, like the genesis pin). |
-| `settlement_epochs` (W) | 3 | how many barriers a post's ticket lives. Longer = you can ban staler posts but the outstanding set and per-scan cost grow; shorter = ban polls must resolve fast. Interacts with `NUM_SCANS_PER_FOLD` — see below. ⚠ |
-| `poll_close_epochs` | 2 | how many barriers a poll accepts votes for. |
+| `settlement_epochs` (W) | 48 hours of barriers | how many barriers a post's ticket lives. Longer = you can ban staler posts but the outstanding set and per-scan cost grow; shorter = ban polls must resolve fast. Interacts with `NUM_SCANS_PER_FOLD` — see below. ⚠ |
+| `poll_close_epochs` | 24 hours of barriers | how many barriers a poll accepts votes for. |
 | `object_root_window` (K) | 256 | how far behind a prover's object root may lag before a verifier drops rather than buffers it. Safe at any size (§5.1, monotone); bounded only by memory. |
 | callback root | **latest barrier, not a knob** | a scan proves against the most recent barrier the verifier has reached (§5.2). No history, no window. This is the anti-monotone discipline; a "window" here re-opens O10. |
 | `authority_keys` | **empty** | the config list of `(pubkey, capabilities ⊆ {ban, grant_badge})` (§7, §11). Empty = no admin ban and no badges — a fully leaderless group. Each key added is residual trust named explicitly. ⚠ |

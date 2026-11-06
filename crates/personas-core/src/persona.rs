@@ -32,6 +32,13 @@ pub fn pseudonym_rate(sk: &F, context: &F, i: &F) -> F {
     H::hash(&[*sk, *context, *i])
 }
 
+/// A member's public key: what `join_pred` proves its `pk` input is. See
+/// [`member_pk_tag`](crate::circuits::member_pk_tag).
+pub fn member_pk(sk: &F) -> F {
+    let tag = crate::circuits::member_pk_tag();
+    H::hash(&[*sk, tag, tag])
+}
+
 /// The human-readable name for a pseudonym: two petname words, seeded by `claimed`.
 ///
 /// Deterministic in `claimed` alone — the client and the server derive the same name

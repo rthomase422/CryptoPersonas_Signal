@@ -269,7 +269,7 @@ export const SmartCompositionArea = memo(function SmartCompositionArea({
     sendPersonaAuthorshipClaim,
     setComposerFocus,
   } = useComposerActions();
-  // Personas demo: topics (and their random contexts) known to this instance. Held
+  // Personas demo: topics (and their contexts) known to this instance. Held
   // in redux because this component's renderer half cannot import preload modules.
   // Per personas group: this conversation's own topics and pseudonyms.
   const personaTopics = useSelector(

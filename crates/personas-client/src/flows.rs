@@ -314,7 +314,11 @@ impl PersonaClient {
         let pk = self.standard_pseudo_pk();
         let epoch = self.epoch()?;
 
-        let pseudo = PseudonymArgs { context, claimed };
+        let pseudo = PseudonymArgs {
+            context,
+            claimed,
+            ..Default::default()
+        };
 
         let start = SystemTime::now();
         let exec = exec_pseudo_standint(&mut user, &mut rng, &self.bul, &pk, epoch, pseudo, ())
@@ -339,6 +343,7 @@ impl PersonaClient {
             context,
             claimed,
             i,
+            ..Default::default()
         };
 
         let start = SystemTime::now();
@@ -373,7 +378,11 @@ impl PersonaClient {
             .ok_or_else(|| anyhow!("this user is not on the bulletin; run `join` first"))?;
         let pk = self.pseudonym_pred_pk();
 
-        let pseudo = PseudonymArgs { context, claimed };
+        let pseudo = PseudonymArgs {
+            context,
+            claimed,
+            ..Default::default()
+        };
 
         let start = SystemTime::now();
         let proof = user
@@ -413,10 +422,12 @@ impl PersonaClient {
             a: PseudonymArgs {
                 context: context1,
                 claimed: claimed1,
+                ..Default::default()
             },
             b: PseudonymArgs {
                 context: context2,
                 claimed: claimed2,
+                ..Default::default()
             },
         };
 

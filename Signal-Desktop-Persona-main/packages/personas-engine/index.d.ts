@@ -113,7 +113,7 @@ export class Engine {
    */
   importCatchUp(history: Buffer): number;
   /** As a group admin: allow `account` one more join. Send it under your own account. */
-  emitRejoinApprove(account: string): Emitted;
+  emitRejoinApprove(account: string, proof?: Buffer | null): Emitted;
   /**
    * As a group admin: ban the author of post `target` (its eh) permanently, at the next
    * barrier, with no poll. Send it under your own account: members ingest it only from
@@ -131,7 +131,7 @@ export class Engine {
   /** For a join or re-join approval: which, and the account it names (hex). */
   recordAccountClaim(
     record: Buffer
-  ): { kind: 'join' | 'rejoin-approve' | 'ban'; account: string } | null;
+  ): { kind: 'join' | 'rejoin-approve' | 'ban' | 'badge-approve'; account: string } | null;
   /**
    * The kind of a record ("Post", "Join", ...), decoded only: nothing verified or
    * applied. For a record the replica is holding, so a post can keep its timeline place.
@@ -261,7 +261,14 @@ export class Engine {
   /** Whether this member's current object is on the bulletin (joined, in sync). */
   memberOnBulletin(): boolean;
   /** Prove a scan without releasing it; returns its eh. Blocks every other emit. */
-  prepareScan(): string;
+  prepareScan(dummy: boolean): string;
+  /** The member has used its interactions, and its next post must wait for a sweep. */
+  scanRequired(): boolean;
+  isSettled(): boolean;
+  canProveIdentity(): boolean;
+  takeLost(): Array<string>;
+  foreignRoots(): number;
+  postContext(eh: string): number | null;
   /** Whether the prepared scan's callback roots are still current. */
   scanStillValid(): boolean;
   /** Release the prepared scan and return it to send. Irrevocable. */

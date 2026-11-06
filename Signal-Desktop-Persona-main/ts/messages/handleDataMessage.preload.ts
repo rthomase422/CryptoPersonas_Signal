@@ -6,14 +6,14 @@ import type { z } from 'zod';
 
 import { createLogger } from '../logging/log.std.ts';
 import {
+  isAttributableRecord,
   ingestRecordForTimeline,
   verifyPersonaAuthorship,
   verifyPersonaBadgeProof,
   waitForPersonasEngineIfStarting,
 } from '../services/personasEngine.preload.ts';
 import {
-  decodePostBadge,
-  decodePostContextName,
+  decodePostText,
   decodeAuthorshipProof,
   decodeBadgeProof,
   decodeRecordBody,
@@ -44,7 +44,10 @@ import {
   isFellowGroupMember,
   isPersonasGroup,
 } from '../services/personasPhantom.preload.ts';
-import { ingestTopicAnnouncement } from '../services/personasTopics.preload.ts';
+import {
+  ingestTopicAnnouncement,
+  verifiedContextName,
+} from '../services/personasTopics.preload.ts';
 import { getPhantomAci } from '../services/personasPhantom.preload.ts';
 import * as Errors from '../types/errors.std.ts';
 
@@ -348,7 +351,11 @@ export async function handleDataMessage(
     const personasRecord = ingestRecordForTimeline(
       personasGroupId,
       initialMessage.body,
-      recordTimestamp(message.get('sent_at'), message.get('serverTimestamp'))
+      recordTimestamp(
+        message.get('sent_at'),
+        message.get('serverTimestamp'),
+        isAttributableRecord(personasGroupId, initialMessage.body)
+      )
     );
     if (personasRecord.kind === 'ingested') {
       log.info(`${idLog}: personas protocol record ingested (no timeline entry)`);
@@ -831,19 +838,21 @@ export async function handleDataMessage(
       // engine's handle for a message), and track it so a ban that settles later
       // flips its flag (see personasFlags).
       if (personasRecord.kind === 'post') {
+        const post = decodePostText(personasRecord.body);
         message.set({
-          body: personasRecord.body,
+          body: post.text,
           persona: personasRecord.persona,
           personaFlagged: personasRecord.flagged,
           personaEh: personasRecord.eh,
           personaAnonymous: personasRecord.persona == null,
           personaPending: personasRecord.pending === true,
-          // The sender's UNVERIFIED badge claim, read off the carriage rather than the
-          // record — the engine has no notion of badges in the serverless model. Stored
-          // as sent, with no validation beyond "is a string": validating it would imply
-          // it means something. The chip that renders it says so.
-          personaBadge: decodePostBadge(initialMessage.body),
-          personaContextName: decodePostContextName(initialMessage.body),
+          // The author's own claim, which nothing checks, though nobody else can change it.
+          personaBadge: post.badge,
+          personaContextName: verifiedContextName(
+            personasGroupId,
+            personasRecord.eh,
+            post.contextName
+          ),
         });
         // DIAGNOSTIC. Two questions this answers that nothing else can:
         //
@@ -860,8 +869,8 @@ export async function handleDataMessage(
           `personas: received post eh=${personasRecord.eh.slice(0, 12)} ` +
           `persona=${personasRecord.persona ?? '(anonymous)'}` +
           `${personasRecord.pending ? ' (held until it applies)' : ''} ` +
-          `context=${decodePostContextName(initialMessage.body) ?? '(none)'} ` +
-          `badge=${decodePostBadge(initialMessage.body) ?? '(none)'}`
+          `context=${post.contextName ?? '(none)'} ` +
+          `badge=${post.badge ?? '(none)'}`
         );
         trackPersonaPost(personasRecord.eh, message.id);
       }
@@ -883,6 +892,7 @@ export async function handleDataMessage(
             kind: personasRecord.descriptor.kind,
           },
         });
+        trackPersonaPost(personasRecord.eh, message.id);
       }
 
       // A badge request or approval. Rendered as a NOTIFICATION, attributed to the real

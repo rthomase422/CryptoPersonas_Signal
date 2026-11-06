@@ -53,6 +53,9 @@ export function PersonaPollMessage({
 }: PersonaPollMessageProps): JSX.Element {
   const isIncoming = direction === 'incoming';
   const hasVoted = poll.myVote != null;
+  // The replica refuses a ballot after a poll closes, so do not offer one.
+  const isClosed = poll.statusLine?.includes('· closed]') ?? false;
+  const isLocked = hasVoted || isClosed;
 
   return (
     <div
@@ -98,7 +101,7 @@ export function PersonaPollMessage({
               type="button"
               // A ZK ballot cannot be recast or withdrawn — the record is already
               // folded into every replica — so once we have voted the options lock.
-              disabled={hasVoted}
+              disabled={isLocked}
               onClick={() =>
                 sendPollVote({ messageId, optionIndexes: [index] })
               }
@@ -106,7 +109,7 @@ export function PersonaPollMessage({
                 'flex w-full items-start gap-3 rounded-lg px-2 py-1 text-start',
                 'outline-none keyboard-mode:focus:axo-focus-ring',
                 'transition-colors duration-250',
-                hasVoted
+                isLocked
                   ? 'cursor-default'
                   : isIncoming
                     ? 'hover:bg-fill-secondary'

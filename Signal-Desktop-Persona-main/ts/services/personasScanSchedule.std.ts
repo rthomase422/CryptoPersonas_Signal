@@ -7,17 +7,28 @@
 // random, whatever they are doing then. A scan never runs because a post is about to go
 // out.
 //
-// How MANY scans a member sends in its slot still depends on its tickets until dummy
-// scans exist, which needs a circuit change. Scans carry no sender, so that count says
-// nothing about who scanned.
+// Every member also sends the same number of scans per epoch, real ones first and dummy
+// ones to make up the count, so the number says nothing about a member's tickets. A
+// member with more tickets than the count still finishes its sweep, because posting waits
+// for that, so the count should cover a typical sweep.
 
-const DEFAULT_SCAN_EPOCH_MS = 60 * 60 * 1_000;
+const DEFAULT_SCAN_EPOCH_MS = 24 * 60 * 60 * 1_000;
+const DEFAULT_SCANS_PER_EPOCH = 36;
 
-// The epoch length: an hour, or PERSONAS_SCAN_EPOCH_MS for a demo. A ban or badge reaches
-// a member's object at its next slot, so this is also how long that can take.
+// The epoch length: a day, or PERSONAS_SCAN_EPOCH_MS for a demo. A ban or badge reaches
+// an honest member's object at its next slot, so this is also how long that can take.
 export function scanEpochMs(override?: string): number {
   const parsed = Number(override);
   return parsed > 0 ? parsed : DEFAULT_SCAN_EPOCH_MS;
+}
+
+// Scans per member per epoch: PERSONAS_SCANS_PER_EPOCH, or enough for a sweep of the
+// tickets a busy member holds over the ban window.
+export function scansPerEpoch(override?: string): number {
+  const parsed = Number(override);
+  return Number.isInteger(parsed) && parsed > 0
+    ? parsed
+    : DEFAULT_SCANS_PER_EPOCH;
 }
 
 export function scanEpochAt(

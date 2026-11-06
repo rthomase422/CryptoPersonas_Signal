@@ -404,7 +404,7 @@ const getAuthorForMessage = (
   // the placeholder "Deleted Account". Label it for what it is.
   // A post still held by the engine (shown as a placeholder) must be tracked for the
   // flag refresher to fill it in; after a restart, rendering it is what re-tracks it.
-  if (message.personaPending && message.personaEh) {
+  if ((message.personaPending || message.personaPoll) && message.personaEh) {
     trackPersonaPost(message.personaEh, message.id);
   }
   let personaTitle: string | undefined;
@@ -1040,19 +1040,24 @@ const getPropsForMessage = (
     // A VERIFIED badge proof. Passed through as stored: verification happened on
     // receipt, and the stored badge name is already the verifier's own output.
     personaBadgeProof: message.personaBadgeProof,
-    // A ZK poll renders from its descriptor plus the engine's own status line. The
-    // status line is read live rather than cached on the message so a tally that moves
-    // (or a poll that closes) shows up without rewriting message state.
+    // A ZK poll renders from its descriptor plus the engine's own status line, read live.
+    // personaPollStatus is what makes the bubble redraw: the timeline's proxy selector
+    // reruns only when a field it read has changed, so the field has to be read on every
+    // pass, not just when the live line is missing.
     personaPoll: message.personaPoll
-      ? {
-          question: message.personaPoll.question,
-          options: message.personaPoll.options,
-          kind: message.personaPoll.kind,
-          myVote: message.personaMyVote,
-          statusLine: message.personaEh
-            ? getPollStatusLine(conversation.groupId, message.personaEh)
-            : undefined,
-        }
+      ? (() => {
+          const storedStatus = message.personaPollStatus;
+          return {
+            question: message.personaPoll.question,
+            options: message.personaPoll.options,
+            kind: message.personaPoll.kind,
+            myVote: message.personaMyVote,
+            statusLine:
+              (message.personaEh
+                ? getPollStatusLine(conversation.groupId, message.personaEh)
+                : undefined) ?? storedStatus,
+          };
+        })()
       : undefined,
     // A badge request/approval notification. `pending` and `canApprove` are read LIVE
     // rather than cached on the message, for the same reason a poll's status line is:

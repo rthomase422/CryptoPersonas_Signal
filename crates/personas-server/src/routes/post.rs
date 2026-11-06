@@ -177,7 +177,11 @@ fn verify_post(
                 &mut st.db,
                 &vk,
                 exec,
-                PseudonymArgs { context, claimed },
+                PseudonymArgs {
+                    context,
+                    claimed,
+                    ..Default::default()
+                },
                 current,
                 INTERACTION,
             )
@@ -203,6 +207,7 @@ fn verify_post(
                     context,
                     claimed,
                     i,
+                    ..Default::default()
                 },
                 current,
                 INTERACTION,

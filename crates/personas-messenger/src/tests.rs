@@ -52,6 +52,7 @@ fn placeholder_keys() -> personas_bulletin::replica::ReplicaKeys {
         scan: vk.clone(),
         badge_request: vk.clone(),
         join: vk.clone(),
+        not_banned: vk.clone(),
         pseudonym_pred: vk,
     }
 }
@@ -66,7 +67,7 @@ fn tick_closes_a_poll_on_the_shared_schedule() {
 
     let transport: std::sync::Arc<dyn transport_api::Transport> =
         std::sync::Arc::new(transport_mock::MockTransport::new());
-    let config = Config::default();
+    let config = Config::fast();
     let mut m = Messenger::<4, 4, 4>::new(
         transport,
         ConversationId("room".into()),
@@ -146,7 +147,7 @@ mod e2e {
     }
 
     // Tiny heights: the mechanism is height-independent (d3's e2e make the same call).
-    const OH: usize = 4;
+    const OH: usize = 32;
     const MH: usize = 4;
     const NH: usize = 4;
     type ObjT = MerkleObjStore<F, OH>;
@@ -164,10 +165,7 @@ mod e2e {
     fn keygen(rng: &mut StdRng) -> Keys {
         let (std_pk, std_vk): (PK, VK) = get_standard_interaction()
             .generate_keys::<H, Snark, Cr, ObjT>(rng, None, F::from(0), false);
-        let dummy_pseudo = PseudonymArgs {
-            context: F::from(0),
-            claimed: F::from(0),
-        };
+        let dummy_pseudo = PseudonymArgs::default();
         let (pseudo_pk, pseudo_vk): (PK, VK) = get_standard_pseudo_interaction()
             .generate_keys::<H, Snark, Cr, ObjT>(rng, None, dummy_pseudo.clone(), false);
         let si: ScanInt<CbT> = get_scan_interaction();
@@ -192,18 +190,18 @@ mod e2e {
                 F,
                 H,
                 MsgUser,
-                F,
-                ark_r1cs_std::fields::fp::FpVar<F>,
+                personas_core::circuits::JoinArgs<F>,
+                personas_core::circuits::JoinArgsVar<F>,
                 (),
                 (),
                 Snark,
-            >(rng, personas_core::circuits::join_pred, F::from(0u64));
+            >(rng, personas_core::circuits::join_pred, Default::default());
         let (not_banned_pk, not_banned_vk): (PK, VK) = generate_keys_for_statement_in::<
             F,
             H,
             MsgUser,
-            F,
-            ark_r1cs_std::fields::fp::FpVar<F>,
+            personas_core::circuits::ResetArgs<F>,
+            personas_core::circuits::ResetArgsVar<F>,
             (),
             (),
             Snark,
@@ -212,17 +210,18 @@ mod e2e {
             rng,
             personas_core::circuits::not_banned_pred,
             None,
-            F::from(0u64),
+            Default::default(),
         );
 
         Keys {
-            not_banned_vk,
+            not_banned_vk: not_banned_vk.clone(),
             replica: ReplicaKeys {
                 standard: std_vk,
                 pseudo: pseudo_vk,
                 pseudo_rate: scan_vk.clone(),   // unused by this suite
                 badge_request: scan_vk.clone(), // unused by this suite
                 join: join_vk,
+                not_banned: not_banned_vk.clone(),
                 scan: scan_vk,
                 pseudonym_pred: pred_vk,
             },
@@ -244,8 +243,26 @@ mod e2e {
     fn config() -> Config {
         Config {
             root_window: 256,
-            settlement_barriers: 3,
-            poll_close_barriers: 1,
+            settlement_barriers: 10,
+            poll_close_barriers: 3,
+        }
+    }
+
+    /// Cross barriers until what was just sent is in a root members can prove from.
+    fn settle(ms: &mut [&mut Msg]) {
+        for m in ms {
+            for _ in 0..personas_bulletin::replica::SETTLE_LAG {
+                m.barrier();
+            }
+        }
+    }
+
+    /// Cross a poll's whole window.
+    fn close_poll(ms: &mut [&mut Msg]) {
+        for m in ms {
+            for _ in 0..config().poll_close_barriers {
+                m.barrier();
+            }
         }
     }
 
@@ -332,6 +349,7 @@ mod e2e {
             deliver(&mut v1, e);
             deliver(&mut v2, e);
         }
+        settle(&mut [&mut poster, &mut v1, &mut v2]);
 
         // (2) The poster posts under a persona (so the ban has a linkable author to
         //     flag), against the full-set root everyone now holds.
@@ -368,11 +386,9 @@ mod e2e {
         // Before the barrier the poll tally is visible but nothing is settled.
         assert_eq!(poster.replica().poll(&poll_eh).unwrap().ban_tally(), (2, 0));
 
-        // (4) Every replica crosses one barrier: the poll closes yes>no, the ticket
+        // (4) Every replica crosses the poll's window: the poll closes yes>no, the ticket
         //     settles with BAN_FLAG, the callback root advances.
-        for m in [&mut poster, &mut v1, &mut v2] {
-            m.barrier();
-        }
+        close_poll(&mut [&mut poster, &mut v1, &mut v2]);
 
         // (5) Convergence: identical object AND callback roots on all three — the ban
         //     is visible identically to everyone.
@@ -440,6 +456,7 @@ mod e2e {
             deliver(&mut poster, e);
             deliver(&mut admin, e);
         }
+        settle(&mut [&mut poster, &mut admin]);
         let post = poster
             .emit_post_pseudo(&mut rng, "the offending post", F::from(0xBA4))
             .unwrap();
@@ -454,9 +471,7 @@ mod e2e {
             admin.replica().derived().polls.is_empty(),
             "no poll is opened"
         );
-        for m in [&mut poster, &mut admin] {
-            m.barrier();
-        }
+        settle(&mut [&mut poster, &mut admin]);
         assert_eq!(fingerprint(&poster), fingerprint(&admin), "both agree");
         assert!(
             poster
@@ -476,6 +491,7 @@ mod e2e {
             F::from(1),
             "banned"
         );
+        settle(&mut [&mut poster, &mut admin]);
         // Its persona proofs are no longer satisfiable: either proving refuses, or the
         // proof it makes is rejected by everyone else.
         match poster.emit_post_anon(&mut rng, "still here?") {
@@ -565,10 +581,13 @@ mod e2e {
         for &(e, t) in &[joins[2], joins[1], joins[0]] {
             deliver_at(&mut obs, e, t);
         }
+        for m in [&mut poster, &mut c, &mut d, &mut obs] {
+            m.tick(2_100);
+        }
 
         // (2) The four "skew set" records, each emitted against the full-join root and
-        //     each stamped with a service timestamp in barrier 0 (< 1000 ms). They are
-        //     emitted now but delivered in scrambled order below.
+        //     each stamped with a service timestamp in barrier 2. They are emitted now but
+        //     delivered in scrambled order below.
         let post = poster
             .emit_post_pseudo(&mut rng, "hot take", F::from(0xBEEFu64))
             .unwrap();
@@ -582,7 +601,7 @@ mod e2e {
             .unwrap();
         let vote_c = c.emit_vote(&mut rng, poll.eh, BAN_OPTION).unwrap();
         let vote_d = d.emit_vote(&mut rng, poll.eh, BAN_OPTION).unwrap();
-        let (post_t, poll_t, vote_c_t, vote_d_t) = (300u64, 400u64, 500u64, 600u64);
+        let (post_t, poll_t, vote_c_t, vote_d_t) = (2_300u64, 2_400u64, 2_500u64, 2_600u64);
 
         // Poster: in order.
         deliver_at(&mut poster, &post, post_t);
@@ -603,12 +622,12 @@ mod e2e {
         deliver_at(&mut c, &poll, poll_t);
         deliver_at(&mut c, &vote_d, vote_d_t);
 
-        // Observer: crosses barrier 1 (the poll-close barrier) with the poll open and no
+        // Observer: crosses barrier 5 (the poll-close barrier) with the poll open and no
         // votes seen — the poll closes tied, no ban — then the votes arrive *late* and
         // must still count.
         deliver_at(&mut obs, &poll, poll_t);
         deliver_at(&mut obs, &post, post_t);
-        obs.tick(1_500);
+        obs.tick(5_500);
         assert_eq!(
             obs.replica().poll(&poll.eh).unwrap().ban_tally(),
             (0, 0),
@@ -622,10 +641,10 @@ mod e2e {
         deliver_at(&mut obs, &vote_d, vote_d_t);
         deliver_at(&mut obs, &vote_c, vote_c_t);
 
-        // (3) Every heartbeat reaches barrier 2 (past the poll close). The observer is at
-        //     barrier 1 already; the others jump straight from 0.
+        // (3) Every heartbeat reaches barrier 6 (past the poll close). The observer is at
+        //     barrier 5 already; the others jump straight from 2.
         for m in [&mut poster, &mut c, &mut d, &mut obs] {
-            m.tick(2_500);
+            m.tick(6_500);
         }
 
         // (4) Exact convergence: identical object AND callback roots on all four.
@@ -704,14 +723,15 @@ mod e2e {
             for j in &joins {
                 deliver_at(m, j, 100);
             }
+            m.tick(2_050);
         }
 
-        // `a` posts in barrier 1, and the messenger delivers it to `a` and `b` only.
+        // `a` posts in barrier 2, and the messenger delivers it to `a` and `b` only.
         let hidden = a
             .emit_post_anon(&mut rng, "only some of you see this")
             .unwrap();
-        deliver_at(&mut a, &hidden, 1100);
-        deliver_at(&mut b, &hidden, 1100);
+        deliver_at(&mut a, &hidden, 2100);
+        deliver_at(&mut b, &hidden, 2100);
         for m in [&mut a, &mut b, &mut c] {
             m.tick(4500);
         }
@@ -737,7 +757,7 @@ mod e2e {
         assert!(
             relays
                 .iter()
-                .any(|(_, bytes)| record::Eh::of_bytes(bytes) == hidden.eh)
+                .any(|(_, bytes)| record::decode(bytes).unwrap().1 == hidden.eh)
         );
         assert!(a.take_relays().is_empty(), "each record is relayed once");
         for (first_barrier, bytes) in &relays {
@@ -752,7 +772,7 @@ mod e2e {
             };
             c.ingest_incoming(&incoming).unwrap().unwrap();
         }
-        assert_eq!(c.replica().first_barrier(&hidden.eh), Some(1));
+        assert_eq!(c.replica().first_barrier(&hidden.eh), Some(2));
         assert_eq!(c.replica().status(&hidden.eh), Some(Status::Applied));
         for barrier in 0..7 {
             assert_eq!(
@@ -840,6 +860,7 @@ mod e2e {
             deliver(&mut v1, e);
             deliver(&mut v2, e);
         }
+        settle(&mut [&mut poster, &mut v1, &mut v2]);
 
         // The poster posts (anon is fine here) and captures a stale scan against the
         // EMPTY callback set *before* any ban — the archived nonmembership range.
@@ -849,11 +870,16 @@ mod e2e {
         for m in [&mut poster, &mut v1, &mut v2] {
             deliver(m, &post);
         }
+        settle(&mut [&mut poster, &mut v1, &mut v2]);
         // Fork the poster's member to build the stale scan without consuming the
         // object it will later scan for real.
         let mut stale_member = poster.member().unwrap().clone();
         let stale = stale_member
-            .scan(&mut rng, poster.replica().obj_store(), &CbT::new())
+            .scan(
+                &mut rng,
+                poster.replica().proving_store().unwrap(),
+                &CbT::new(),
+            )
             .expect("stale scan proof");
         let (stale_bytes, _) = record::encode(&stale).unwrap();
 
@@ -877,7 +903,7 @@ mod e2e {
                 deliver(m, &e);
             }
         }
-        v1.barrier();
+        close_poll(&mut [&mut v1]);
 
         // The stale scan, delivered to the barrier-crossed replica, is rejected: it
         // names a superseded (pre-ban) callback barrier.
@@ -928,6 +954,7 @@ mod e2e {
             deliver(&mut poster, &e);
             deliver(&mut peer, &e);
         }
+        settle(&mut [&mut poster, &mut peer]);
         let first = poster
             .emit_post_pseudo(&mut rng, "before the restart", F::from(9))
             .unwrap();
@@ -939,6 +966,30 @@ mod e2e {
         let records = poster.replica().seen_with_barriers();
         let barrier = poster.replica().current_barrier();
         drop(poster);
+
+        // How the app restores: an empty replica, then the whole journal imported at once.
+        let journal = records
+            .iter()
+            .map(|(at, bytes)| {
+                let eh = personas_bulletin::replica::record::decode(bytes).unwrap().1;
+                (*at, eh, bytes.clone())
+            })
+            .collect();
+        let mut imported = Msg::restore(
+            transport.clone(),
+            conv.clone(),
+            keys.replica.clone(),
+            config(),
+            Some(Member::from_state(&state, keys.member.clone()).unwrap()),
+            Vec::new(),
+            barrier,
+        );
+        imported.import_records(journal, barrier);
+        assert_eq!(fingerprint(&imported), fingerprint(&peer));
+        assert!(
+            imported.member_on_bulletin(),
+            "a journal import keeps the object on the tree"
+        );
 
         let mut restored = Msg::restore(
             transport,
@@ -954,6 +1005,7 @@ mod e2e {
             restored.member_on_bulletin(),
             "the restored object is on the tree"
         );
+        settle(&mut [&mut restored, &mut peer]);
 
         let second = restored
             .emit_post_pseudo(&mut rng, "after the restart", F::from(9))
@@ -1005,15 +1057,17 @@ mod e2e {
                 deliver(m, e);
             }
         }
+        settle(&mut [&mut poster, &mut v1, &mut v2]);
         let post = poster
             .emit_post_pseudo(&mut rng, "post", F::from(1))
             .unwrap();
         for m in [&mut poster, &mut v1, &mut v2] {
             deliver(m, &post);
         }
+        settle(&mut [&mut poster, &mut v1, &mut v2]);
 
         let before = poster.export_member_state().unwrap().unwrap();
-        poster.prepare_scan(&mut rng).expect("prepare");
+        poster.prepare_scan(&mut rng, false).expect("prepare");
         assert!(poster.scan_still_valid());
         assert!(
             matches!(
@@ -1048,9 +1102,7 @@ mod e2e {
                 deliver(m, &e);
             }
         }
-        for m in [&mut poster, &mut v1, &mut v2] {
-            m.barrier();
-        }
+        close_poll(&mut [&mut poster, &mut v1, &mut v2]);
         assert!(
             !poster.scan_still_valid(),
             "the settlement made the scan stale"
@@ -1063,7 +1115,7 @@ mod e2e {
             "a discard restores the exact pre-scan object"
         );
 
-        poster.prepare_scan(&mut rng).expect("re-prepare");
+        poster.prepare_scan(&mut rng, false).expect("re-prepare");
         assert!(poster.scan_still_valid());
         let scan = poster.commit_scan().unwrap();
         assert!(matches!(
@@ -1102,11 +1154,13 @@ mod e2e {
         );
         let join = m.emit_join(&mut rng, acct()).unwrap();
         deliver(&mut m, &join);
+        settle(&mut [&mut m]);
         for i in 0..3u64 {
             let e = m
                 .emit_post_pseudo(&mut rng, "post", F::from(100 + i))
                 .unwrap();
             deliver(&mut m, &e);
+            settle(&mut [&mut m]);
         }
         assert_eq!(m.member().unwrap().user.num_outstanding_callbacks(), 3);
         assert!(
@@ -1125,10 +1179,11 @@ mod e2e {
 
         let mut remaining = Vec::new();
         for _ in 0..3 {
-            m.prepare_scan(&mut rng).unwrap();
+            m.prepare_scan(&mut rng, false).unwrap();
             let scan = m.commit_scan().unwrap();
             deliver(&mut m, &scan);
             remaining.push(m.sweep_remaining());
+            settle(&mut [&mut m]);
         }
         assert_eq!(remaining, vec![2, 1, 0], "one scan per callback");
         assert!(
@@ -1187,6 +1242,7 @@ mod e2e {
         );
         let join = group.emit_join(&mut rng, acct()).unwrap();
         deliver(&mut group, &join);
+        group.barrier();
 
         let mut forger = Member::create(member_keys, &mut rng);
         forger.user.data.badge1 = *FACULTY_F;
@@ -1240,11 +1296,11 @@ mod e2e {
         status(&mut alice, &j);
         let j = alice.emit_join(&mut rng, F::from(7002u64)).unwrap();
         status(&mut admin, &j);
+        settle(&mut [&mut admin, &mut alice]);
         let p = alice.emit_post_anon(&mut rng, "an old secret").unwrap();
         assert_eq!(status(&mut admin, &p), Status::Applied);
         let old_post = p.eh;
-        admin.barrier();
-        alice.barrier();
+        settle(&mut [&mut admin, &mut alice]);
 
         // A newcomer WITHOUT the history: its post is held back by everyone.
         let mut stranded = new_member(&mut rng);
@@ -1252,6 +1308,7 @@ mod e2e {
         for m in [&mut admin, &mut alice] {
             status(m, &j);
         }
+        settle(&mut [&mut stranded]);
         let p = stranded.emit_post_anon(&mut rng, "hello?").unwrap();
         assert_eq!(status(&mut admin, &p), Status::Buffered, "the old failure");
         assert_eq!(status(&mut alice, &p), Status::Buffered);
@@ -1282,6 +1339,7 @@ mod e2e {
         for m in [&mut admin, &mut alice] {
             assert_eq!(status(m, &j), Status::Applied);
         }
+        settle(&mut [&mut admin, &mut alice, &mut bob]);
         let p = bob.emit_post_anon(&mut rng, "hi all").unwrap();
         for m in [&mut admin, &mut alice] {
             assert_eq!(status(m, &p), Status::Applied, "bob can send");
@@ -1315,11 +1373,7 @@ mod e2e {
         let status = |m: &mut Msg, e: &Emitted| deliver(m, e).unwrap().unwrap();
         // Records in one barrier are ordered by eh, not by arrival; the client keeps a
         // re-join a barrier after its approval, and so does this test.
-        let tick = |ms: [&mut Msg; 2]| {
-            for m in ms {
-                m.barrier();
-            }
-        };
+        let tick = |mut ms: [&mut Msg; 2]| settle(&mut ms);
 
         let j = admin.emit_join(&mut rng, admin_acct).unwrap();
         status(&mut alice, &j);
@@ -1339,11 +1393,21 @@ mod e2e {
         ));
         let forced = forger
             .user
-            .prove_statement::<H, F, ark_r1cs_std::fields::fp::FpVar<F>, (), (), Snark>(
+            .prove_statement::<
+                H,
+                personas_core::circuits::JoinArgs<F>,
+                personas_core::circuits::JoinArgsVar<F>,
+                (),
+                (),
+                Snark,
+            >(
                 &mut rng,
                 join_pred,
                 &keys.member.join,
-                F::from(1u64),
+                personas_core::circuits::JoinArgs {
+                    account: F::from(1u64),
+                    pk: persona::member_pk(&forger.user.data.sk),
+                },
                 (),
             )
             .unwrap();
@@ -1351,6 +1415,7 @@ mod e2e {
             object: Ark(forced.object),
             old_nul: Ark(F::from(0u64)),
             account: Ark(F::from(1u64)),
+            pk: Ark(persona::member_pk(&forger.user.data.sk)),
             proof: Ark(forced.proof),
         })
         .unwrap();
@@ -1372,7 +1437,7 @@ mod e2e {
         };
         assert_eq!(
             status(&mut admin, &forged),
-            Status::Rejected("join proof failed")
+            Status::Rejected("proof failed")
         );
         // ...nor can a valid proof be pinned to someone else's object or account.
         let honest = Member::create(keys.member.clone(), &mut rng)
@@ -1385,6 +1450,7 @@ mod e2e {
             object: Ark(forger.commitment()),
             old_nul: Ark(F::from(0u64)),
             account: Ark(F::from(2u64)),
+            pk: Ark(persona::member_pk(&forger.user.data.sk)),
             proof,
         })
         .unwrap();
@@ -1395,7 +1461,7 @@ mod e2e {
         };
         assert_eq!(
             status(&mut admin, &swapped),
-            Status::Rejected("join proof failed")
+            Status::Rejected("proof failed")
         );
 
         // One join per account: a second identity for alice is refused.
@@ -1422,12 +1488,13 @@ mod e2e {
             }
         }
         while alice.scan_needed() {
-            alice.prepare_scan(&mut rng).unwrap();
+            alice.prepare_scan(&mut rng, false).unwrap();
             let scan = alice.commit_scan().unwrap();
             assert_eq!(status(&mut admin, &scan), Status::Applied);
+            tick([&mut alice, &mut admin]);
         }
         let proof = alice.prove_not_banned(&mut rng, alice_acct).unwrap();
-        let (account, root) =
+        let (account, _nul, root) =
             personas_core::verify_not_banned_proof(&keys.not_banned_vk, &proof).unwrap();
         assert_eq!(account, alice_acct);
         assert!(
@@ -1436,7 +1503,7 @@ mod e2e {
         );
 
         // The admin approves; alice resets to a fresh object and joins once more.
-        let approve = admin.emit_rejoin_approve(alice_acct).unwrap();
+        let approve = admin.emit_rejoin_approve(alice_acct, Some(&proof)).unwrap();
         status(&mut alice, &approve);
         assert_eq!(alice.replica().join_counts(alice_acct), (1, 1));
         tick([&mut alice, &mut admin]);
@@ -1459,6 +1526,373 @@ mod e2e {
         assert_eq!(fingerprint(&alice), fingerprint(&admin));
     }
 
+    /// Two joined members, and the helpers the tests below share.
+    fn joined_pair(rng: &mut StdRng, keys: &Keys, conv: &str) -> (Msg, Msg, F) {
+        let transport: Arc<dyn Transport> = Arc::new(MockTransport::new());
+        let conv = ConversationId(conv.into());
+        let mut new_member = || {
+            Msg::new(
+                transport.clone(),
+                conv.clone(),
+                keys.replica.clone(),
+                config(),
+                Some(Member::create(keys.member.clone(), &mut *rng)),
+            )
+        };
+        let (mut admin, mut alice) = (new_member(), new_member());
+        let alice_acct = F::from(9002u64);
+        let j = admin.emit_join(&mut *rng, F::from(9001u64)).unwrap();
+        deliver(&mut alice, &j);
+        let j = alice.emit_join(&mut *rng, alice_acct).unwrap();
+        deliver(&mut admin, &j);
+        settle(&mut [&mut admin, &mut alice]);
+        (admin, alice, alice_acct)
+    }
+
+    fn status_of(m: &mut Msg, e: &Emitted) -> Status {
+        deliver(m, e).unwrap().unwrap()
+    }
+
+    /// A dummy scan is accepted like any other and changes nothing about the member, so a
+    /// member's scan count can be fixed whatever tickets it holds.
+    #[test]
+    #[ignore = "generates real Groth16 keys/proofs; run with --release --ignored"]
+    fn e2e_a_dummy_scan_is_accepted_and_changes_nothing() {
+        let mut rng = StdRng::seed_from_u64(31);
+        let keys = keygen(&mut rng);
+        let (mut admin, mut alice, _) = joined_pair(&mut rng, &keys, "dummy");
+
+        // With no tickets at all, and again with one outstanding.
+        for round in 0..2 {
+            let before = alice.member.as_ref().unwrap().user.data.clone();
+            let tickets = alice
+                .member
+                .as_ref()
+                .unwrap()
+                .user
+                .num_outstanding_callbacks();
+            alice.prepare_scan(&mut rng, true).unwrap();
+            let scan = alice.commit_scan().unwrap();
+            assert_eq!(status_of(&mut admin, &scan), Status::Applied, "round {round}");
+            settle(&mut [&mut admin, &mut alice]);
+            let member = alice.member.as_ref().unwrap();
+            assert_eq!(member.user.data.num_interactions_since_last_scan,
+                before.num_interactions_since_last_scan);
+            assert_eq!(member.user.num_outstanding_callbacks(), tickets);
+            assert!(!member.user.is_scanning());
+
+            let post = alice.emit_post_anon(&mut rng, "still fine").unwrap();
+            assert_eq!(status_of(&mut admin, &post), Status::Applied);
+            settle(&mut [&mut admin, &mut alice]);
+        }
+        assert_eq!(fingerprint(&alice), fingerprint(&admin));
+    }
+
+    /// A post cannot go out mid-sweep, and one scan of a longer sweep buys no allowance:
+    /// otherwise a banned member could alternate scans and posts and never reach the ban.
+    #[test]
+    #[ignore = "generates real Groth16 keys/proofs; run with --release --ignored"]
+    fn e2e_a_post_cannot_interrupt_a_sweep() {
+        let mut rng = StdRng::seed_from_u64(32);
+        let keys = keygen(&mut rng);
+        let (mut admin, mut alice, _) = joined_pair(&mut rng, &keys, "sweep");
+        for text in ["one", "two"] {
+            let post = alice.emit_post_anon(&mut rng, text).unwrap();
+            assert_eq!(status_of(&mut admin, &post), Status::Applied);
+            settle(&mut [&mut admin, &mut alice]);
+        }
+        for m in [&mut alice, &mut admin] {
+            for _ in 0..=config().settlement_barriers {
+                m.barrier();
+            }
+        }
+        alice.prepare_scan(&mut rng, false).unwrap();
+        let scan = alice.commit_scan().unwrap();
+        assert_eq!(status_of(&mut admin, &scan), Status::Applied);
+        let member = alice.member.as_ref().unwrap();
+        assert!(member.user.is_scanning(), "two tickets need two scans");
+        assert_eq!(
+            member.user.data.num_interactions_since_last_scan,
+            F::from(2u64),
+            "an unfinished sweep does not reset the count"
+        );
+        settle(&mut [&mut admin, &mut alice]);
+        // The client refuses this itself, so stand in for one modified not to.
+        alice.member.as_mut().unwrap().user.force_clear_scan_index();
+        let post = alice.emit_post_anon(&mut rng, "mid-sweep").unwrap();
+        assert_eq!(
+            status_of(&mut admin, &post),
+            Status::Rejected("proof failed")
+        );
+    }
+
+    /// Two accounts cannot share a secret key.
+    #[test]
+    #[ignore = "generates real Groth16 keys/proofs; run with --release --ignored"]
+    fn e2e_two_accounts_cannot_share_a_key() {
+        let mut rng = StdRng::seed_from_u64(33);
+        let keys = keygen(&mut rng);
+        let (mut admin, alice, _) = joined_pair(&mut rng, &keys, "clone");
+        let sk = alice.member.as_ref().unwrap().user.data.sk;
+        let mut member = Member::create(keys.member.clone(), &mut rng);
+        member.user = zk_callbacks::generic::user::User::create(
+            personas_core::circuits::MsgUser {
+                sk,
+                ..Default::default()
+            },
+            &mut rng,
+        );
+        let mut clone = Msg::new(
+            Arc::new(MockTransport::new()),
+            ConversationId("clone".into()),
+            keys.replica.clone(),
+            config(),
+            Some(member),
+        );
+        let j = clone.emit_join(&mut rng, F::from(9003u64)).unwrap();
+        assert_eq!(
+            status_of(&mut admin, &j),
+            Status::Rejected("public key belongs to another account")
+        );
+    }
+
+    /// A reset keeps the secret key, and approving it retires the object given up, so the
+    /// member cannot keep a second object a ban would miss.
+    #[test]
+    #[ignore = "generates real Groth16 keys/proofs; run with --release --ignored"]
+    fn e2e_a_reset_keeps_the_key_and_retires_the_old_object() {
+        let mut rng = StdRng::seed_from_u64(34);
+        let keys = keygen(&mut rng);
+        let (mut admin, mut alice, account) = joined_pair(&mut rng, &keys, "reset");
+        let old = alice.member.as_ref().unwrap().user.clone();
+        let proof = alice.prove_not_banned(&mut rng, account).unwrap();
+        let approve = admin.emit_rejoin_approve(account, Some(&proof)).unwrap();
+        assert_eq!(status_of(&mut alice, &approve), Status::Applied);
+        admin.barrier();
+        alice.barrier();
+
+        alice.reset_member(&mut rng).unwrap();
+        assert_eq!(alice.member.as_ref().unwrap().user.data.sk, old.data.sk);
+        let rejoin = alice.emit_join(&mut rng, account).unwrap();
+        assert_eq!(status_of(&mut admin, &rejoin), Status::Applied);
+        admin.barrier();
+        alice.barrier();
+
+        alice.member.as_mut().unwrap().user = old;
+        let post = alice.emit_post_anon(&mut rng, "from the old object").unwrap();
+        assert_eq!(
+            status_of(&mut admin, &post),
+            Status::Rejected("nullifier already spent")
+        );
+    }
+
+    /// A ban on a settled pseudonymous post still reaches its author: the pseudonym stays
+    /// marked, and its next post is flagged and carries the ban to the member's object.
+    #[test]
+    #[ignore = "generates real Groth16 keys/proofs; run with --release --ignored"]
+    fn e2e_a_ban_follows_a_pseudonym_past_settlement() {
+        let mut rng = StdRng::seed_from_u64(35);
+        let keys = keygen(&mut rng);
+        let (mut admin, mut alice, _) = joined_pair(&mut rng, &keys, "retarget");
+        let context = F::from(0x7Au64);
+        let old = alice.emit_post_pseudo(&mut rng, "old", context).unwrap();
+        assert_eq!(status_of(&mut admin, &old), Status::Applied);
+        for m in [&mut admin, &mut alice] {
+            for _ in 0..=config().settlement_barriers {
+                m.barrier();
+            }
+        }
+        let settled = |m: &Msg, eh| m.replica().derived().outstanding[eh].settled;
+        assert!(settled(&admin, &old.eh));
+
+        let ban = admin.emit_ban(old.eh).unwrap();
+        assert_eq!(status_of(&mut alice, &ban), Status::Applied);
+        let flagged = |m: &Msg, eh: &Eh| {
+            m.replica()
+                .log()
+                .iter()
+                .find(|e| e.eh == *eh)
+                .is_some_and(|e| e.flagged)
+        };
+        assert!(flagged(&admin, &old.eh), "the old post is flagged at once");
+
+        let new = alice.emit_post_pseudo(&mut rng, "new", context).unwrap();
+        assert_eq!(status_of(&mut admin, &new), Status::Applied);
+        assert!(flagged(&admin, &new.eh), "and so is the next one");
+        settle(&mut [&mut admin, &mut alice]);
+        assert!(settled(&admin, &new.eh), "called at once, with the ban");
+
+        while alice.scan_needed() {
+            alice.prepare_scan(&mut rng, false).unwrap();
+            let scan = alice.commit_scan().unwrap();
+            assert_eq!(status_of(&mut admin, &scan), Status::Applied);
+            settle(&mut [&mut admin, &mut alice]);
+        }
+        assert_eq!(alice.member().unwrap().user.data.banned, F::from(1));
+    }
+
+    /// A ticket waits for a ban poll opened in time, so the clock cannot run out on it,
+    /// and a poll that closes takes no more ballots.
+    #[test]
+    #[ignore = "generates real Groth16 keys/proofs; run with --release --ignored"]
+    fn e2e_a_ban_poll_holds_its_ticket_and_closes() {
+        let mut rng = StdRng::seed_from_u64(36);
+        let keys = keygen(&mut rng);
+        let (mut admin, mut alice, _) = joined_pair(&mut rng, &keys, "hold");
+        let post = alice.emit_post_anon(&mut rng, "text").unwrap();
+        assert_eq!(status_of(&mut admin, &post), Status::Applied);
+        for m in [&mut admin, &mut alice] {
+            for _ in 0..config().settlement_barriers - 1 {
+                m.barrier();
+            }
+        }
+        let poll = admin
+            .emit_poll(
+                "ban?",
+                render::ban_poll_options(),
+                PollKind::Ban,
+                Some(post.eh),
+            )
+            .unwrap();
+        status_of(&mut alice, &poll);
+        let ballot = admin.emit_vote(&mut rng, poll.eh, BAN_OPTION).unwrap();
+        status_of(&mut alice, &ballot);
+        settle(&mut [&mut admin, &mut alice]);
+        let ticket = |m: &Msg| m.replica().derived().outstanding[&post.eh].clone();
+        assert!(!ticket(&admin).settled, "past its window, and still held");
+        for m in [&mut admin, &mut alice] {
+            m.barrier();
+        }
+        assert!(ticket(&admin).banned && ticket(&admin).settled, "the ban landed");
+        assert_eq!(fingerprint(&alice), fingerprint(&admin));
+
+        let late = alice.emit_vote(&mut rng, poll.eh, 1).unwrap();
+        assert_eq!(status_of(&mut admin, &late), Status::Rejected("poll closed"));
+        assert_eq!(admin.replica().poll(&poll.eh).unwrap().ban_tally(), (1, 0));
+    }
+
+    /// A vote does not wait for the member's last action to settle, and being proved from
+    /// the object before it changes nothing: same pseudonym, so still one ballot.
+    #[test]
+    #[ignore = "generates real Groth16 keys/proofs; run with --release --ignored"]
+    fn e2e_a_vote_does_not_wait_for_a_post_to_settle() {
+        let mut rng = StdRng::seed_from_u64(39);
+        let keys = keygen(&mut rng);
+        let (mut admin, mut alice, _) = joined_pair(&mut rng, &keys, "vote-now");
+        let poll = admin
+            .emit_poll("q", vec!["a".into(), "b".into()], PollKind::Standard, None)
+            .unwrap();
+        status_of(&mut alice, &poll);
+
+        let post = alice.emit_post_anon(&mut rng, "text").unwrap();
+        status_of(&mut admin, &post);
+        assert!(!alice.is_settled() && alice.can_prove_identity());
+        let first = alice.emit_vote(&mut rng, poll.eh, 0).unwrap();
+        assert_eq!(status_of(&mut admin, &first), Status::Applied);
+        assert!(!alice.is_settled(), "voting left the newest object in place");
+
+        settle(&mut [&mut admin, &mut alice]);
+        let second = alice.emit_vote(&mut rng, poll.eh, 1).unwrap();
+        status_of(&mut admin, &second);
+        let counts = admin.replica().poll(&poll.eh).unwrap().counts();
+        assert_eq!(counts.get(&0), Some(&1), "the first ballot stands");
+        assert_eq!(counts.get(&1), None, "the second is the same member");
+    }
+
+    /// With a clock, a barrier counts as settled once a few seconds of the next have passed,
+    /// so a member need not wait out a whole barrier.
+    #[test]
+    #[ignore = "generates real Groth16 keys/proofs; run with --release --ignored"]
+    fn e2e_a_barrier_settles_a_few_seconds_into_the_next() {
+        let mut rng = StdRng::seed_from_u64(40);
+        let keys = keygen(&mut rng);
+        let mut m = Msg::new(
+            Arc::new(MockTransport::new()),
+            ConversationId("margin".into()),
+            keys.replica.clone(),
+            config(),
+            Some(Member::create(keys.member.clone(), &mut rng)),
+        )
+        .with_heartbeat(Heartbeat::new(0, 10_000));
+        m.tick(20_500);
+        let join = m.emit_join(&mut rng, F::from(9201u64)).unwrap();
+        deliver_at(&mut m, &join, 20_600);
+        m.tick(30_500);
+        assert!(!m.is_settled(), "its barrier has only just closed");
+        m.tick(32_900);
+        assert!(!m.is_settled(), "still inside the margin");
+        m.tick(33_100);
+        assert!(m.is_settled());
+        let post = m.emit_post_anon(&mut rng, "text").unwrap();
+        assert_eq!(deliver_at(&mut m, &post, 33_200).unwrap().unwrap(), Status::Applied);
+    }
+
+    /// A rating is one step either way, and negative feedback counts.
+    #[test]
+    #[ignore = "generates real Groth16 keys/proofs; run with --release --ignored"]
+    fn e2e_ratings_are_one_step_and_can_go_down() {
+        let mut rng = StdRng::seed_from_u64(37);
+        let keys = keygen(&mut rng);
+        let (mut admin, mut alice, _) = joined_pair(&mut rng, &keys, "rate");
+        let post = alice.emit_post_anon(&mut rng, "text").unwrap();
+        status_of(&mut admin, &post);
+        let big = admin.emit_rate(&mut rng, post.eh, 100).unwrap();
+        assert_eq!(status_of(&mut alice, &big), Status::Rejected("a rating is +1 or -1"));
+        let down = admin.emit_rate(&mut rng, post.eh, -1).unwrap();
+        assert_eq!(status_of(&mut alice, &down), Status::Applied);
+        let ticket = &alice.replica().derived().outstanding[&post.eh];
+        assert_eq!(ticket.clamped_rep(), -1);
+    }
+
+    /// The re-base. Alice proves against a root holding one of a barrier's two records,
+    /// because the other reached her too late. No one else ever produced that root, so her
+    /// record is lost. She gets her object back and can send again, and the group can tell
+    /// that views differed.
+    #[test]
+    #[ignore = "generates real Groth16 keys/proofs; run with --release --ignored"]
+    fn e2e_a_lost_record_gives_the_object_back() {
+        let mut rng = StdRng::seed_from_u64(38);
+        let keys = keygen(&mut rng);
+        let (mut admin, mut alice, _) = joined_pair(&mut rng, &keys, "rebase");
+        let barrier = admin.replica().current_barrier();
+        let mut join = |account: u64| {
+            let mut m = Msg::new(
+                Arc::new(MockTransport::new()),
+                ConversationId("other".into()),
+                keys.replica.clone(),
+                config(),
+                Some(Member::create(keys.member.clone(), &mut rng)),
+            );
+            let mut rng = StdRng::seed_from_u64(account);
+            m.emit_join(&mut rng, F::from(account)).unwrap()
+        };
+        let (on_time, late) = (join(9101), join(9102));
+        status_of(&mut admin, &on_time);
+        status_of(&mut alice, &on_time);
+        status_of(&mut admin, &late);
+        settle(&mut [&mut admin, &mut alice]);
+
+        let before = alice.export_member_state().unwrap().unwrap();
+        let lost = alice.emit_post_anon(&mut rng, "lost").unwrap();
+        assert_eq!(
+            status_of(&mut admin, &lost),
+            Status::Buffered,
+            "it names a root the group never had"
+        );
+
+        alice.replica.ingest_at(late.bytes.clone(), barrier).unwrap();
+        settle(&mut [&mut admin, &mut alice]);
+        for m in [&mut admin, &mut alice] {
+            m.barrier();
+        }
+        assert_eq!(alice.take_lost(), vec![lost.eh]);
+        assert_eq!(alice.export_member_state().unwrap().unwrap(), before);
+        assert_eq!(admin.foreign_roots(), 1, "the admin can see views differed");
+
+        let resent = alice.emit_post_anon(&mut rng, "resent").unwrap();
+        assert_eq!(status_of(&mut admin, &resent), Status::Applied);
+    }
+
     /// A late joiner adopts a snapshot from an inviter, TOFU-pinned (§12): with the
     /// right pin it re-derives identical roots; a wrong pin is refused.
     #[test]
@@ -1479,6 +1913,7 @@ mod e2e {
         );
         let join = inviter.emit_join(&mut rng, acct()).unwrap();
         deliver(&mut inviter, &join);
+        settle(&mut [&mut inviter]);
         let post = inviter
             .emit_post_pseudo(&mut rng, "history", F::from(9))
             .unwrap();
