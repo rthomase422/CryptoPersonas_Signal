@@ -59,7 +59,7 @@ const TAG_BYTES = 16;
 type Storage = { key: Buffer<ArrayBuffer>; dir: string };
 
 let storage: Storage | undefined;
-let initialized = false;
+let initialized: Promise<void> | undefined;
 
 // One per personas group: the folder its state lives in (named by the group's bundle),
 // and the member state most recently saved for it.
@@ -80,11 +80,15 @@ export function registerPersistedExtra(name: string, extra: Extra): void {
 }
 
 /** Fetch the state key from the main process. Call (and await) before building an engine. */
-export async function initPersonasPersistence(): Promise<void> {
-  if (initialized) {
-    return;
-  }
-  initialized = true;
+export function initPersonasPersistence(): Promise<void> {
+  // One shared promise: each group warms its engine at startup, and a caller that returned
+  // before the key arrived would build its engine with no storage. That member starts
+  // new on every restart, and nothing it spends is saved.
+  initialized ??= fetchStateStorage();
+  return initialized;
+}
+
+async function fetchStateStorage(): Promise<void> {
   try {
     const result = (await ipcRenderer.invoke('personas:state-storage')) as
       | { key: string; dir: string }
