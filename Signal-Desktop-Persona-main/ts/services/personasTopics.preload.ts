@@ -34,8 +34,6 @@
 // KNOWN LIMIT: a member who joins after a topic was announced will not have it, since
 // there is no backfill. Re-announcing on join, or a server registry, would fix it.
 
-import { createHash } from 'node:crypto';
-
 import type { ConversationModel } from '../models/conversations.preload.ts';
 import {
   personasExtrasChanged,
@@ -49,14 +47,9 @@ import {
   encodeTopicAnnouncement,
   type PersonaTopicAnnouncement,
 } from './personasCarriage.std.ts';
+import { contextForTopic, topicNameInContext } from './personasTopicContext.std.ts';
 
 const log = createLogger('personasTopics');
-
-// Contexts are hashed inside the circuit as a field element. Stay well inside the
-// exact-integer range of a JS number (2^53) so the value survives JSON and the napi
-// boundary unchanged — a context that differs by one bit between members produces a
-// different persona and silently breaks linkability within the topic.
-const CONTEXT_BYTES = 6; // 48 bits
 
 // Per personas group: name -> context. Rebuilt from announcements as they arrive.
 const byGroup = new Map<string, Map<string, number>>();
@@ -90,22 +83,6 @@ registerPersistedExtra('topics', {
   },
 });
 
-// A topic's context is a hash of its name, so a name has exactly one context. If members
-// could pick the number, anyone could mint fresh contexts that display under an existing
-// topic's name, and get a fresh allowance of rate-limited personas in it each time.
-export function contextForTopic(groupId: string, rawName: string): number {
-  const bytes = createHash('sha256')
-    .update(`${groupId}\u0000${rawName.trim().toLowerCase()}`)
-    .digest()
-    .subarray(0, CONTEXT_BYTES);
-  let value = 0;
-  for (const byte of bytes) {
-    value = value * 256 + byte;
-  }
-  // Never 0 — that is the "no topic" sentinel used by the unlimited plain pseudonym.
-  return value === 0 ? 1 : value;
-}
-
 /**
  * The topic name a post may display: the one it claims, if the post's proof really is in
  * that topic's context. The name and the context are each bound to the post, but only
@@ -119,8 +96,11 @@ export function verifiedContextName(
   if (!groupId || !contextName) {
     return undefined;
   }
-  const context = getPersonasEngine(groupId)?.postContext(eh);
-  return context === contextForTopic(groupId, contextName) ? contextName : undefined;
+  return topicNameInContext(
+    groupId,
+    getPersonasEngine(groupId)?.postContext(eh),
+    contextName
+  );
 }
 
 /** Every topic this instance knows about in a group, for the composer's picker. */

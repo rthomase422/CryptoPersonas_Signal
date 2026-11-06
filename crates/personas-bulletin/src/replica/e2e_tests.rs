@@ -19,8 +19,9 @@ use rand::{SeedableRng, rngs::StdRng};
 use ark_ff::UniformRand;
 
 use personas_core::circuits::{
-    BAN_FLAG, MsgUser, NUM_SCANS_PER_FOLD, PrivScan, PrivScanVar, PseudonymArgs, PseudonymArgsVar,
-    PubScan, PubScanVar, ScanInt, get_callbacks, get_scan_interaction, get_standard_interaction,
+    BAN_FLAG, MsgUser, NUM_SCANS_PER_FOLD, PrivScan, PrivScanVar, PseudonymArgs, PseudonymArgsRate,
+    PseudonymArgsRateVar, PseudonymArgsVar, PubScan, PubScanVar, ScanInt, get_callbacks,
+    get_scan_interaction, get_standard_interaction, get_standard_pseudo_rate_interaction,
     pseudonym_pred,
 };
 use personas_core::{Args, ArgsVar, Cr, F, H, PK, Snark, VK, persona};
@@ -812,4 +813,90 @@ fn a_post_cannot_publish_a_ticket_its_proof_did_not_commit_to() {
     // A refused copy leaves the identity free for the real record.
     r.ingest_at(s.post.clone(), 0).unwrap();
     assert_eq!(r.status(&s.post_eh), Some(Status::Applied));
+}
+
+/// Audit M5: a rate-limited post is bound to its topic and its persona number. The topic a
+/// client displays rests on `post_context`, so the context in the record must be the one
+/// the proof was made in, and a fourth persona must not get in by editing the record.
+#[test]
+#[ignore = "generates real Groth16 keys/proofs; run with --release --ignored"]
+fn a_rate_limited_post_cannot_change_its_topic_or_persona() {
+    let mut rng = StdRng::seed_from_u64(78);
+    let (rate_pk, rate_vk): (PK, VK) = get_standard_pseudo_rate_interaction()
+        .generate_keys::<H, Snark, Cr, ObjT>(&mut rng, None, PseudonymArgsRate::default(), false);
+    let mut keys = standard_only_keys(&rate_vk);
+    keys.pseudo_rate = rate_vk;
+
+    let mut author = member(&mut rng);
+    let join = join_of(&author);
+    let mut shadow = ObjT::new();
+    shadow.push(join.0, F::from(0), vec![]);
+    let root = shadow.root();
+
+    let body = "rate limited";
+    let payload = super::record::post_payload(body);
+    let context = F::from(123_456u64);
+    let i = F::from(2u64);
+    let claimed = persona::pseudonym_rate(&author.data.sk, &context, &i);
+    let exec = author
+        .exec_method_create_cb::<H, PseudonymArgsRate<F>, PseudonymArgsRateVar<F>, (), (), Args, ArgsVar, Cr, Snark, ObjT, 1>(
+            &mut rng,
+            get_standard_pseudo_rate_interaction(),
+            [FakeSigPubkey::pk()],
+            Time::from(0),
+            &shadow,
+            false,
+            &rate_pk,
+            PseudonymArgsRate {
+                context,
+                claimed,
+                i,
+                payload,
+            },
+            (),
+        )
+        .expect("post proof");
+    let (post, post_eh) = encode(&Record::Post {
+        flavour: Flavour::PseudoRate,
+        exec: Ark(exec),
+        extra: Ark(vec![context, claimed, i]),
+        body: body.into(),
+        payload: Ark(payload),
+        obj_root: Ark(root),
+    })
+    .unwrap();
+
+    let with_extra = |index: usize, value: u64| {
+        rewrite(&post, &|r| {
+            if let Record::Post { extra, .. } = r {
+                extra.0[index] = F::from(value);
+            }
+        })
+    };
+    let (other_topic, other_topic_eh) = with_extra(0, 654_321);
+    let (other_persona, other_persona_eh) = with_extra(2, 1);
+    let (fourth_persona, fourth_persona_eh) = with_extra(2, 3);
+
+    let config = Config {
+        root_window: 256,
+        settlement_barriers: 3,
+        poll_close_barriers: 1,
+    };
+    let mut r = Replica::<OH, MH, NH>::new(keys, config).trust_unproven_joins_for_tests();
+    r.ingest_at(join.1, 0).unwrap();
+    r.advance_to(1);
+
+    for forged in [other_topic, other_persona, fourth_persona] {
+        assert!(matches!(
+            r.ingest_at(forged, 1).unwrap(),
+            Status::Rejected(_)
+        ));
+    }
+    assert_eq!(r.ingest_at(post, 1).unwrap(), Status::Applied);
+
+    assert_eq!(r.post_context(&post_eh), Some(123_456));
+    for forged in [other_topic_eh, other_persona_eh, fourth_persona_eh] {
+        assert_ne!(r.status(&forged), Some(Status::Applied));
+        assert_eq!(r.post_context(&forged), None);
+    }
 }

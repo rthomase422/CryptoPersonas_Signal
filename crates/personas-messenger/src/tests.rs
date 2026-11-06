@@ -109,6 +109,34 @@ fn tick_closes_a_poll_on_the_shared_schedule() {
     );
 }
 
+/// Audit M5: the messenger refuses a fourth persona before it spends anything. The circuit
+/// and the replica refuse it too, in their own tests.
+#[test]
+fn a_fourth_persona_in_a_topic_is_refused() {
+    use personas_bulletin::replica::Config;
+    use personas_core::F;
+    use rand::{SeedableRng, rngs::StdRng};
+    use transport_api::ConversationId;
+
+    let transport: std::sync::Arc<dyn transport_api::Transport> =
+        std::sync::Arc::new(transport_mock::MockTransport::new());
+    let mut m = Messenger::<4, 4, 4>::new(
+        transport,
+        ConversationId("room".into()),
+        placeholder_keys(),
+        Config::fast(),
+        None,
+    );
+    let mut rng = StdRng::seed_from_u64(1);
+
+    let refused = m.emit_post_pseudo_rate(&mut rng, "hello", F::from(7u64), F::from(3u64));
+
+    assert!(matches!(
+        refused,
+        Err(SendError::PersonaIndexOutOfRange { number: 4, limit: 3 })
+    ));
+}
+
 // ---------------------------------------------------------------------------------------
 // End-to-end, real Groth16 (#[ignore])
 // ---------------------------------------------------------------------------------------
