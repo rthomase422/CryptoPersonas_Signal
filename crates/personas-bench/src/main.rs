@@ -813,17 +813,29 @@ fn run_ops(args: &Args, keys_dir: &std::path::Path) -> BTreeMap<String, OpResult
     }
 
     if wanted("moderation") {
-        // An admin's permanent ban: Carol posts, Bob bans the post, one barrier later the
-        // post's callback is invoked (post callback) and the epoch is updated. Carol never
-        // scans, so she can keep posting.
+        // An admin's permanent ban: a member posts, Bob bans the post, one barrier later
+        // the post's callback is invoked (post callback) and the epoch is updated. The
+        // offender never scans again (a scan would absorb the ban and stop its posts), so
+        // it can make only the interactions left before the cap: Carol posts until then,
+        // then Alice. Both start clear. This is the last operation, so neither is needed
+        // after it.
         g.barrier_all(Config::fast().settlement_barriers as usize + 1);
+        g.drain_untimed(Who::Carol);
+        g.drain_untimed(Who::Alice);
         let mut s = Samples::default();
         for i in 0..total {
-            let post = g
-                .carol
-                .emit_post_anon(&mut g.rng, "offending")
-                .expect("post");
-            g.deliver_all_but(Who::Carol, &post);
+            let offender = if g.carol.scan_required() {
+                Who::Alice
+            } else {
+                Who::Carol
+            };
+            let rng = &mut g.rng;
+            let post = match offender {
+                Who::Alice => g.alice.emit_post_anon(rng, "offending"),
+                _ => g.carol.emit_post_anon(rng, "offending"),
+            }
+            .expect("post");
+            g.deliver_all_but(offender, &post);
             let ban = g.bob.emit_ban(post.eh).expect("ban");
             g.deliver_all_but(Who::Bob, &ban);
             let before = g.bob.replica().last_settle_timings();

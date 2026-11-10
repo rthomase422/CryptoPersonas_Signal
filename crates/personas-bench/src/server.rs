@@ -43,10 +43,10 @@ use url::Url;
 
 use crate::{Args, Summary, machine, micros, summarize};
 
-/// Posts a member can make before it must scan (`NUM_INTS_BEFORE_SCAN`, minus slack).
+/// Posts or ticket requests a member can make before it must scan (`NUM_INTS_BEFORE_SCAN`,
+/// minus slack). Members who would need more are replaced by fresh ones, untimed.
 const POSTS_PER_MEMBER: usize = 15;
-/// The most `--load-requests`: at concurrency 1 one member takes every ticket, and the
-/// levels together must stay under that same cap.
+/// The most `--load-requests`.
 const MAX_LOAD_REQUESTS: usize = 128;
 
 #[derive(Serialize)]
@@ -300,30 +300,40 @@ fn run_load(
         }));
     }
 
-    // A member's ticket stash is one file, so each worker keeps to its own member.
+    // A member's ticket stash is one file, so each worker keeps to its own members, and
+    // ticket requests count toward the interaction cap, so a worker that redeems more
+    // than POSTS_PER_MEMBER tickets holds several members' stashes.
     for &concurrency in &levels {
-        let per_member = total / concurrency;
-        let workers = &members[..concurrency];
-        for m in workers {
-            for _ in 0..per_member {
-                m.privpass_request().expect("ticket request failed");
-            }
-        }
-        runs.push(burst(
-            "pp_post",
-            concurrency,
-            workers.iter().collect(),
-            |m| {
-                (0..per_member)
-                    .map(|_| {
+        let per_worker = total / concurrency;
+        let workers: Vec<Vec<(PersonaClient, usize)>> = (0..concurrency)
+            .map(|w| {
+                let mut stashes = Vec::new();
+                let mut left = per_worker;
+                while left > 0 {
+                    let n = left.min(POSTS_PER_MEMBER);
+                    let m = member(&format!("load-pp-{concurrency}-{w}-{}", stashes.len()));
+                    for _ in 0..n {
+                        m.privpass_request().expect("ticket request failed");
+                    }
+                    stashes.push((m, n));
+                    left -= n;
+                }
+                stashes
+            })
+            .collect();
+        runs.push(burst("pp_post", concurrency, workers, |stashes| {
+            stashes
+                .iter()
+                .flat_map(|(m, n)| {
+                    (0..*n).map(move |_| {
                         let start = Instant::now();
                         m.privpass_redeem_post("bench".into(), "bench".into(), None)
                             .map(|()| micros(start))
                             .map_err(|e| e.to_string())
                     })
-                    .collect()
-            },
-        ));
+                })
+                .collect()
+        }));
     }
     runs
 }
@@ -433,9 +443,14 @@ pub fn run(args: &Args, work: &Path, callbacks: usize) {
     let mut ops = std::collections::BTreeMap::new();
 
     // --- prove each post --------------------------------------------------------------------
-    let poster = member("poster");
+    // A fresh poster every POSTS_PER_MEMBER posts: a member must scan before the
+    // interaction cap, and scans are measured on their own below.
+    let mut poster = member("poster-0");
     let mut rt = Vec::new();
-    for _ in 0..total {
+    for i in 0..total {
+        if i > 0 && i % POSTS_PER_MEMBER == 0 {
+            poster = member(&format!("poster-{}", i / POSTS_PER_MEMBER));
+        }
         let proof = poster.gen_cb_for_msg().expect("post failed");
         rt.push(post_json(&http, jsonrpc.clone(), proof));
     }
@@ -451,11 +466,17 @@ pub fn run(args: &Args, work: &Path, callbacks: usize) {
     eprintln!("post: done");
 
     // --- Privacy Pass: request tickets offline, redeem them to post -------------------------
-    let ticketed = member("ticketed");
+    // Ticket requests count toward the interaction cap too: a fresh member every
+    // POSTS_PER_MEMBER requests, and each redeems its own tickets.
+    let ticketed: Vec<PersonaClient> = (0..total.div_ceil(POSTS_PER_MEMBER))
+        .map(|k| member(&format!("ticketed-{k}")))
+        .collect();
     let mut rt = Vec::new();
-    for _ in 0..total {
+    for i in 0..total {
         let start = Instant::now();
-        ticketed.privpass_request().expect("ticket request failed");
+        ticketed[i / POSTS_PER_MEMBER]
+            .privpass_request()
+            .expect("ticket request failed");
         rt.push(micros(start));
     }
     ops.insert(
@@ -468,9 +489,9 @@ pub fn run(args: &Args, work: &Path, callbacks: usize) {
         },
     );
     let mut rt = Vec::new();
-    for _ in 0..total {
+    for i in 0..total {
         let start = Instant::now();
-        ticketed
+        ticketed[i / POSTS_PER_MEMBER]
             .privpass_redeem_post("bench".into(), "bench".into(), None)
             .expect("redemption failed");
         rt.push(micros(start));
