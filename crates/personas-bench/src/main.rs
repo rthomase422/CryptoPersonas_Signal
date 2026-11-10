@@ -450,20 +450,8 @@ impl Group {
             self.settle_all();
             if i % 24 == 23 {
                 self.barrier_all(Config::fast().settlement_barriers as usize + 1);
-                for who in [Who::Bob, Who::Carol] {
-                    let mut rounds = 0;
-                    while self.engine(who).scan_needed() && rounds < 400 {
-                        rounds += 1;
-                        let rng = &mut self.rng;
-                        let e = match who {
-                            Who::Bob => self.bob.emit_scan(rng),
-                            _ => self.carol.emit_scan(rng),
-                        }
-                        .expect("scan");
-                        self.deliver_all_but(who, &e);
-                        self.settle_all();
-                    }
-                }
+                self.drain_untimed(Who::Bob);
+                self.drain_untimed(Who::Carol);
             }
         }
         self.barrier_all(Config::fast().settlement_barriers as usize + 1);
@@ -471,6 +459,25 @@ impl Group {
             "history: {n} records in {:.1}s",
             started.elapsed().as_secs_f64()
         );
+    }
+
+    /// A member other than Alice absorbs its settled callbacks with scans, untimed. Bob
+    /// and Carol post to give Alice something to act on, and like any member they must
+    /// scan before reaching the protocol's interaction cap.
+    fn drain_untimed(&mut self, who: Who) {
+        let mut rounds = 0;
+        while self.engine(who).scan_needed() && rounds < 400 {
+            rounds += 1;
+            let rng = &mut self.rng;
+            let e = match who {
+                Who::Alice => self.alice.emit_scan(rng),
+                Who::Bob => self.bob.emit_scan(rng),
+                Who::Carol => self.carol.emit_scan(rng),
+            }
+            .expect("scan");
+            self.deliver_all_but(who, &e);
+            self.settle_all();
+        }
     }
 
     /// Alice posts `k` times and lets every ticket settle without scanning, so her object
@@ -686,6 +693,10 @@ fn run_ops(args: &Args, keys_dir: &std::path::Path) -> BTreeMap<String, OpResult
             "rating",
             // One rating per member per post: Bob posts, Alice rates it.
             &mut |g, _| {
+                if g.bob.scan_required() {
+                    g.barrier_all(Config::fast().settlement_barriers as usize + 1);
+                    g.drain_untimed(Who::Bob);
+                }
                 let post = g.bob.emit_post_anon(&mut g.rng, "rate me").expect("post");
                 g.deliver_all_but(Who::Bob, &post);
                 g.alice.emit_rate(&mut g.rng, post.eh, 1).expect("rating")
